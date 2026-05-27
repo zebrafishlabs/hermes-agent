@@ -355,6 +355,18 @@ class TestSlackProxyBehavior:
 
                 return decorator
 
+            def shortcut(self, callback_id):
+                # Match Slack-bolt's API surface so adapter registration
+                # of message shortcuts (ESC-272) doesn't blow up tests.
+                if not hasattr(self, "registered_shortcuts"):
+                    self.registered_shortcuts = []
+                self.registered_shortcuts.append(callback_id)
+
+                def decorator(fn):
+                    return fn
+
+                return decorator
+
         class FakeSocketModeHandler:
             def __init__(self, app, app_token, proxy=None):
                 self.app = app
@@ -432,6 +444,18 @@ class TestSlackProxyBehavior:
 
             def action(self, action_id):
                 self.registered_actions.append(action_id)
+
+                def decorator(fn):
+                    return fn
+
+                return decorator
+
+            def shortcut(self, callback_id):
+                # Match Slack-bolt's API surface so adapter registration
+                # of message shortcuts (ESC-272) doesn't blow up tests.
+                if not hasattr(self, "registered_shortcuts"):
+                    self.registered_shortcuts = []
+                self.registered_shortcuts.append(callback_id)
 
                 def decorator(fn):
                     return fn
@@ -3172,3 +3196,92 @@ class TestSlashEphemeralAck:
         # the normal single-user case; the ContextVar path is the precise one.
         # The key invariant is: when the ContextVar IS set, it matches exactly.
         assert ctx is not None  # fallback path finds the entry
+
+
+# ---------------------------------------------------------------------------
+# Close shortcut (ESC-272) — message shortcuts carry full thread context
+# (channel + thread_ts), unlike slash commands which omit thread_ts.
+# ---------------------------------------------------------------------------
+
+
+class TestCloseShortcut:
+    """Slack 'Close Hermes thread' message shortcut routes /close with thread context."""
+
+    @pytest.fixture
+    def adapter(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.slack import SlackAdapter
+
+        config = PlatformConfig(enabled=True, token="xoxb-test")
+        adapter = SlackAdapter(config)
+        adapter._app = MagicMock()  # marks adapter "connected enough" for build_source
+        adapter._channel_team = {}
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_payload_routes_with_thread_ts(self, adapter):
+        """When the shortcut fires on a reply, thread_ts is the parent's ts."""
+        captured_events = []
+
+        async def fake_handle_message(event):
+            captured_events.append(event)
+
+        adapter.handle_message = fake_handle_message
+
+        payload = {
+            "channel": {"id": "C0123"},
+            "user": {"id": "U_USER"},
+            "team": {"id": "T_TEAM"},
+            "message": {"ts": "9999.0001", "thread_ts": "1234.5678"},
+        }
+
+        await adapter._handle_close_shortcut(payload)
+
+        assert len(captured_events) == 1
+        ev = captured_events[0]
+        assert ev.text == "/close"
+        assert ev.source.thread_id == "1234.5678"
+        assert ev.source.chat_id == "C0123"
+        assert ev.source.user_id == "U_USER"
+
+    @pytest.mark.asyncio
+    async def test_thread_parent_payload_uses_message_ts_as_thread_id(self, adapter):
+        """When the shortcut fires on the parent, message.ts IS the thread_id."""
+        captured = []
+
+        async def fake_handle_message(event):
+            captured.append(event)
+
+        adapter.handle_message = fake_handle_message
+
+        payload = {
+            "channel": {"id": "C0123"},
+            "user": {"id": "U_USER"},
+            "team": {"id": "T_TEAM"},
+            "message": {"ts": "1234.5678"},  # no thread_ts — this IS the parent
+        }
+
+        await adapter._handle_close_shortcut(payload)
+
+        assert len(captured) == 1
+        assert captured[0].source.thread_id == "1234.5678"
+
+    @pytest.mark.asyncio
+    async def test_on_session_closed_adds_white_check_mark(self, adapter):
+        """The adapter override drops a ✅ reaction on the thread parent."""
+        adapter._add_reaction = AsyncMock(return_value=True)
+
+        await adapter.on_session_closed("C0123", "1234.5678")
+
+        adapter._add_reaction.assert_awaited_once_with(
+            "C0123", "1234.5678", "white_check_mark"
+        )
+
+    @pytest.mark.asyncio
+    async def test_on_session_closed_no_thread_is_noop(self, adapter):
+        """Without a thread_id (channel-level close), no reaction is posted."""
+        adapter._add_reaction = AsyncMock()
+
+        await adapter.on_session_closed("C0123", None)
+
+        adapter._add_reaction.assert_not_called()

@@ -1179,6 +1179,30 @@ class SessionStore:
 
         return new_entry
 
+    def close_session(self, session_key: str) -> Optional[SessionEntry]:
+        """End a session WITHOUT creating a fresh entry.
+
+        Unlike :py:meth:`reset_session`, removes ``session_key`` from
+        ``_entries`` entirely. The next message in this channel/thread will
+        create a brand-new session.
+        """
+        db_end_session_id = None
+        old_entry = None
+        with self._lock:
+            self._ensure_loaded_locked()
+            if session_key not in self._entries:
+                return None
+            old_entry = self._entries[session_key]
+            db_end_session_id = old_entry.session_id
+            self._entries.pop(session_key, None)
+            self._save()
+        if self._db and db_end_session_id:
+            try:
+                self._db.close_session(db_end_session_id)
+            except Exception as e:
+                logger.debug("Session DB close failed: %s", e)
+        return old_entry
+
     def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
         """Switch a session key to point at an existing session ID.
 

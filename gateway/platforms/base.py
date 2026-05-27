@@ -2856,6 +2856,13 @@ class BasePlatformAdapter(ABC):
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Hook called when background processing completes."""
 
+    async def on_session_closed(self, channel_id: str, thread_id: Optional[str]) -> None:
+        """Hook called when a session is closed via ``/close``.
+
+        Default no-op. Slack overrides to drop a ✅ reaction on the thread
+        parent so the user can see at-a-glance that the thread is closed.
+        """
+
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
         hook = getattr(self, hook_name, None)

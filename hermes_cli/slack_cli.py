@@ -58,6 +58,14 @@ def _build_full_manifest(bot_name: str, bot_description: str) -> dict:
                 "always_online": True,
             },
             "slash_commands": slashes,
+            "shortcuts": [
+                {
+                    "name": "Close Hermes thread",
+                    "type": "message",
+                    "callback_id": "close_hermes_thread",
+                    "description": "End the Hermes session for this thread.",
+                },
+            ],
             "assistant_view": {
                 "assistant_description": "Chat with Hermes in threads and DMs.",
             },

@@ -8505,6 +8505,13 @@ class HermesCLI:
             ) is None:
                 return
             self.new_session(title=title)
+        elif canonical == "close":
+            # CLI sessions are local — /close and /new are effectively the
+            # same locally (no channel/thread state to tear down).  Roll a
+            # fresh session and print the close-specific confirmation so
+            # the wording matches the gateway response.
+            self.new_session()
+            _cprint("Thread closed — next message starts a new session.")
         elif canonical == "resume":
             self._handle_resume_command(cmd_original)
         elif canonical == "sessions":

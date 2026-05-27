@@ -253,6 +253,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_state TEXT,
     handoff_platform TEXT,
     handoff_error TEXT,
+    closed INTEGER DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -925,6 +926,20 @@ class SessionDB:
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
 
+    def close_session(self, session_id: str) -> None:
+        """Mark a session as closed in the DB (does not delete it).
+
+        Sets ``closed = 1`` and backfills ``ended_at`` / ``end_reason`` only
+        if they were not already populated (so an earlier end record wins).
+        """
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET closed = 1, "
+                "ended_at = COALESCE(ended_at, ?), "
+                "end_reason = COALESCE(end_reason, ?) WHERE id = ?",
+                (time.time(), "session_close", session_id),
+            )
+        self._execute_write(_do)
 
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
