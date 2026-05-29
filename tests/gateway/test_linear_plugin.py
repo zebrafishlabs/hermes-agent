@@ -884,3 +884,135 @@ class TestThreadResolution:
             _run(asyncio.sleep(0))
         assert resp.status == 202
         assert "event" in captured
+
+
+def _multi_response_session(bodies):
+    """aiohttp.ClientSession mock returning a different json body per POST call.
+
+    `bodies` is a list of dicts; the Nth POST returns the Nth body (last one
+    repeats). Returns (session, post_mock) so call_args_list can be asserted.
+    """
+    state = {"i": 0}
+
+    def _make_ctx(*args, **kwargs):
+        idx = min(state["i"], len(bodies) - 1)
+        body = bodies[idx]
+        state["i"] += 1
+        resp = MagicMock()
+        resp.status = 200
+        resp.json = AsyncMock(return_value=body)
+        resp.text = AsyncMock(return_value=json.dumps(body))
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=resp)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        return ctx
+
+    session = MagicMock()
+    session.post = MagicMock(side_effect=_make_ctx)
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+    return session, session.post
+
+
+class TestEsc294Fixes:
+    """ESC-294: edit-in-place progress, synthetic-root + deleted-comment safety."""
+
+    _ENTITY_NOT_FOUND = {"errors": [{"message": "Entity not found: Comment"}]}
+    _CREATE_OK = {"data": {"commentCreate": {"success": True,
+                  "comment": {"id": "new-c", "url": "u"}}}}
+    _UPDATE_OK = {"data": {"commentUpdate": {"success": True,
+                  "comment": {"id": "edited-c", "url": "u"}}}}
+    _DELETE_OK = {"data": {"commentDelete": {"success": True}}}
+
+    # --- outbound retry-top-level on Entity not found -----------------------
+
+    def test_post_comment_retries_top_level_on_entity_not_found(self):
+        # 1st call (with parentId) -> Entity not found; 2nd (no parentId) -> ok.
+        session, post = _multi_response_session([self._ENTITY_NOT_FOUND, self._CREATE_OK])
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = _run(_post_linear_comment("iss", "body", "key", parent_id="bad-parent"))
+        assert result["success"] is True
+        assert post.call_count == 2
+        # 1st call carried parentId; retry dropped it.
+        first_vars = post.call_args_list[0].kwargs["json"]["variables"]
+        second_vars = post.call_args_list[1].kwargs["json"]["variables"]
+        assert first_vars.get("parentId") == "bad-parent"
+        assert "parentId" not in second_vars
+
+    def test_post_comment_no_retry_when_no_parent(self):
+        # Entity-not-found without a parentId is a real failure, no retry.
+        session, post = _multi_response_session([self._ENTITY_NOT_FOUND])
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = _run(_post_linear_comment("iss", "body", "key", parent_id=None))
+        assert result["success"] is False
+        assert post.call_count == 1
+
+    # --- synthetic agent-session root anchoring -----------------------------
+
+    def test_artificial_session_root_anchors_to_issue(self):
+        adapter = _make_adapter()
+        payload = _comment_payload(body="@escher-hermes help",
+                                   comment_id="synthetic-1", actor_name="Chris")
+        payload["data"]["isArtificialAgentSessionRoot"] = True
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        with patch.object(adapter, "handle_message", new=_capture), \
+             patch.object(_linear, "_fetch_thread_context",
+                          new=AsyncMock(return_value=None)):
+            resp = _run(adapter._handle_linear_webhook(_signed_request(payload)))
+            _run(asyncio.sleep(0))
+        assert resp.status == 202
+        # session keyed per-ISSUE (2-part), not on the synthetic comment id
+        assert captured["event"].source.chat_id == "linear:uuid-123"
+        assert "synthetic-1" not in captured["event"].source.chat_id
+
+    def test_normal_comment_still_threads(self):
+        # control: non-synthetic top-level comment keys on its own id (3-part)
+        adapter = _make_adapter()
+        payload = _comment_payload(body="@escher-hermes help",
+                                   comment_id="real-1", actor_name="Chris")
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        with patch.object(adapter, "handle_message", new=_capture), \
+             patch.object(_linear, "_fetch_thread_context",
+                          new=AsyncMock(return_value=None)):
+            resp = _run(adapter._handle_linear_webhook(_signed_request(payload)))
+            _run(asyncio.sleep(0))
+        assert captured["event"].source.chat_id == "linear:uuid-123:real-1"
+
+    # --- edit-in-place + delete --------------------------------------------
+
+    def test_edit_message_calls_comment_update(self):
+        adapter = _make_adapter()
+        session, post = _mock_graphql_session(json_body=self._UPDATE_OK)
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = _run(adapter.edit_message(
+                chat_id="linear:iss:root", message_id="prog-c", content="updated"))
+        assert result.success is True
+        q = post.call_args.kwargs["json"]
+        assert "commentUpdate" in q["query"]
+        assert q["variables"]["id"] == "prog-c"
+        assert q["variables"]["body"] == "updated"
+
+    def test_edit_message_overrides_base(self):
+        # The gateway gates edit-in-place on edit_message being overridden.
+        from gateway.platforms.base import BasePlatformAdapter
+        assert LinearAdapter.edit_message is not BasePlatformAdapter.edit_message
+
+    def test_delete_message_calls_comment_delete(self):
+        adapter = _make_adapter()
+        session, post = _mock_graphql_session(json_body=self._DELETE_OK)
+        with patch("aiohttp.ClientSession", return_value=session):
+            ok = _run(adapter.delete_message(chat_id="linear:iss", message_id="c1"))
+        assert ok is True
+        assert "commentDelete" in post.call_args.kwargs["json"]["query"]
+
+    def test_delete_message_overrides_base(self):
+        from gateway.platforms.base import BasePlatformAdapter
+        assert LinearAdapter.delete_message is not BasePlatformAdapter.delete_message

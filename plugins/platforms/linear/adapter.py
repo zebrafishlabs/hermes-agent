@@ -62,6 +62,8 @@ References:
   ESC-286 — Linear↔Hermes gateway platform adapter
   ESC-290 — Thread-per-comment sessions, parentId threading, thread read-back
   ESC-291 — Resolution gate: stay quiet in resolved threads, respond on re-open
+  ESC-294 — Edit-in-place progress (commentUpdate), synthetic-root + deleted-
+            comment safety (retry top-level on "Entity not found")
 """
 
 from __future__ import annotations
@@ -276,6 +278,17 @@ async def _post_linear_comment(
     # GraphQL errors on HTTP 200
     if data.get("errors"):
         errs = "; ".join(e.get("message", str(e)) for e in data["errors"])
+        # ESC-294: if threading failed because the parent comment id won't
+        # resolve (deleted mid-run, or a synthetic agent-session root that
+        # isn't a valid parentId target), retry WITHOUT parentId so the reply
+        # still lands top-level rather than being lost entirely.
+        if parent_id and "Entity not found" in errs:
+            logger.warning(
+                "[linear] commentCreate parentId=%s failed (%s) — "
+                "retrying top-level so the reply is not lost (ESC-294)",
+                parent_id, errs,
+            )
+            return await _post_linear_comment(issue_id, body, api_key, parent_id=None)
         return {"success": False, "error": f"GraphQL errors: {errs}"}
 
     result = data.get("data", {}).get("commentCreate", {})
@@ -288,6 +301,99 @@ async def _post_linear_comment(
         "comment_id": comment.get("id"),
         "comment_url": comment.get("url"),
     }
+
+
+async def _update_linear_comment(
+    comment_id: str,
+    body: str,
+    api_key: str,
+) -> dict:
+    """Edit an existing Linear comment in place via GraphQL commentUpdate.
+
+    Used for B2 edit-in-place progress (ESC-294): the gateway posts one status
+    comment, then edits it as progress changes, the final edit resolving it into
+    the substantive reply — so a long run leaves exactly ONE comment and fires
+    one notification, instead of a trail of progress bubbles.
+
+    Returns a dict with ``success``, optionally ``comment_id``, or ``error``.
+    """
+    try:
+        import aiohttp
+    except ImportError:
+        return {"success": False, "error": "aiohttp not installed"}
+
+    mutation = """
+    mutation UpdateComment($id: String!, $body: String!) {
+      commentUpdate(id: $id, input: {body: $body}) {
+        success
+        comment { id url }
+      }
+    }
+    """
+    headers = {
+        "Authorization": api_key,  # raw key, NO "Bearer" prefix
+        "Content-Type": "application/json",
+    }
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as session:
+            async with session.post(
+                LINEAR_GRAPHQL_URL,
+                headers=headers,
+                json={"query": mutation, "variables": {"id": comment_id, "body": body}},
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    return {"success": False, "error": f"HTTP {resp.status}: {text[:200]}"}
+                data = await resp.json()
+    except Exception as exc:
+        return {"success": False, "error": f"Request failed: {exc}"}
+
+    if data.get("errors"):
+        errs = "; ".join(e.get("message", str(e)) for e in data["errors"])
+        return {"success": False, "error": f"GraphQL errors: {errs}"}
+
+    result = data.get("data", {}).get("commentUpdate", {})
+    if not result.get("success"):
+        return {"success": False, "error": "commentUpdate returned success=false"}
+    comment = result.get("comment") or {}
+    return {"success": True, "comment_id": comment.get("id")}
+
+
+async def _delete_linear_comment(comment_id: str, api_key: str) -> dict:
+    """Delete a Linear comment via GraphQL commentDelete (ESC-294).
+
+    Used as the cleanup backstop; the primary progress UX is edit-in-place.
+    Returns ``{success: bool, error?: str}``.
+    """
+    try:
+        import aiohttp
+    except ImportError:
+        return {"success": False, "error": "aiohttp not installed"}
+
+    mutation = "mutation DeleteComment($id: String!) { commentDelete(id: $id) { success } }"
+    headers = {"Authorization": api_key, "Content-Type": "application/json"}
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as session:
+            async with session.post(
+                LINEAR_GRAPHQL_URL,
+                headers=headers,
+                json={"query": mutation, "variables": {"id": comment_id}},
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    return {"success": False, "error": f"HTTP {resp.status}: {text[:200]}"}
+                data = await resp.json()
+    except Exception as exc:
+        return {"success": False, "error": f"Request failed: {exc}"}
+
+    if data.get("errors"):
+        errs = "; ".join(e.get("message", str(e)) for e in data["errors"])
+        return {"success": False, "error": f"GraphQL errors: {errs}"}
+    return {"success": bool(data.get("data", {}).get("commentDelete", {}).get("success"))}
 
 
 # ---------------------------------------------------------------------------
@@ -681,7 +787,23 @@ class LinearAdapter(BasePlatformAdapter):
         # Thread-per-comment session keying (ESC-290): Linear threads are one
         # level deep, so the root comment is parentId (when this is a reply)
         # else the comment's own id (when it is a top-level comment).
-        root_comment_id: str = data.get("parentId") or comment_id
+        root_comment_id: Optional[str] = data.get("parentId") or comment_id
+
+        # ESC-294: Linear marks synthetic agent-session root comments with
+        # isArtificialAgentSessionRoot. Those ids are NOT safe to query or use
+        # as a parentId target (they raise "Entity not found"). When the
+        # triggering comment is such a synthetic root, drop the threading anchor
+        # so the session keys per-issue and the reply posts top-level instead of
+        # failing. (The outbound retry-top-level in _post_linear_comment is the
+        # backstop; this avoids the wasted failed call and the blind read-back.)
+        if data.get("isArtificialAgentSessionRoot"):
+            logger.info(
+                "[linear] Triggering comment %s is an artificial agent-session "
+                "root — anchoring to issue, not threading on the synthetic id "
+                "(ESC-294)",
+                comment_id,
+            )
+            root_comment_id = None
 
         if not issue_id:
             logger.warning("[linear] Comment event missing issueId — ignoring")
@@ -696,7 +818,12 @@ class LinearAdapter(BasePlatformAdapter):
         # Session keyed per THREAD (issue + root comment) so distinct threads on
         # one issue get distinct sessions; the issueId stays recoverable for the
         # outbound commentCreate and the root id drives parentId threading.
-        session_chat_id = f"linear:{issue_id}:{root_comment_id}"
+        # When root_comment_id is None (synthetic agent-session root, ESC-294),
+        # fall back to the 2-part per-issue key + top-level reply.
+        if root_comment_id:
+            session_chat_id = f"linear:{issue_id}:{root_comment_id}"
+        else:
+            session_chat_id = f"linear:{issue_id}"
         source = self.build_source(
             chat_id=session_chat_id,
             chat_name=f"Linear/{issue_identifier}",
@@ -826,6 +953,49 @@ class LinearAdapter(BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str) -> None:
         """Linear has no typing indicator API — no-op."""
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Edit a previously posted Linear comment in place (ESC-294, B2).
+
+        Overriding this flips the gateway into edit-in-place mode for progress
+        (gateway/run.py gates on ``edit_message`` being overridden): one status
+        comment is posted, then edited as the run progresses, the final edit
+        resolving it into the substantive reply.  ``message_id`` is the Linear
+        comment id returned by a prior ``send()``.  ``finalize`` is a no-op for
+        Linear — an edit is an edit; the last edit just carries the final body.
+        """
+        if not message_id:
+            return SendResult(success=False, error="edit_message: empty message_id")
+        if not self._api_key:
+            return SendResult(success=False, error="LINEAR_API_KEY not set")
+        result = await _update_linear_comment(message_id, content, self._api_key)
+        if not result["success"]:
+            logger.warning("[linear] commentUpdate failed: %s", result.get("error"))
+        return SendResult(
+            success=result["success"],
+            message_id=result.get("comment_id") or message_id,
+            error=result.get("error"),
+        )
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a previously posted Linear comment (ESC-294 cleanup backstop).
+
+        Returns True on success, False otherwise (callers fall back to leaving
+        the comment in place).
+        """
+        if not message_id or not self._api_key:
+            return False
+        result = await _delete_linear_comment(message_id, self._api_key)
+        if not result.get("success"):
+            logger.debug("[linear] commentDelete failed: %s", result.get("error"))
+        return bool(result.get("success"))
 
     async def send_image(
         self,
