@@ -385,6 +385,25 @@ class TestPluginShape:
         assert "LINEAR_API_KEY" in kwargs["required_env"]
         assert kwargs["standalone_sender_fn"] is _standalone_send
 
+    def test_register_is_exported_from_package_init(self):
+        """The plugin loader imports register() from the package __init__, not
+        adapter.py. A bare __init__ (no re-export) makes the loader log
+        'has no register() function' and the platform never registers — the
+        exact bug that blocked the first deploy. Guard the re-export."""
+        import importlib.util
+        from pathlib import Path
+        init_path = (
+            Path(_linear.__file__).resolve().parent / "__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "linear_pkg_init_probe", init_path
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert hasattr(mod, "register"), (
+            "plugins/platforms/linear/__init__.py must re-export register()"
+        )
+
     def test_connect_registers_route_in_core_hook(self):
         from gateway.platforms.webhook import _plugin_route_registry
         _plugin_route_registry.pop("/webhooks/linear-comments", None)
