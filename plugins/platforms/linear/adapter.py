@@ -17,16 +17,46 @@ Inbound flow:
          ├─ HMAC-SHA256 validation
          ├─ self-loop guard (actor.name / actor.email)
          ├─ mention filter (@escher-hermes regex)
-         └─ handle_message() → per-issue agent session (thread key = issueId)
+         ├─ GraphQL read-back of the full thread + issue context
+         └─ handle_message() → per-THREAD agent session
+
+Thread-per-comment sessions (ESC-290):
+  Linear comments are one level deep — a thread is a root comment plus flat
+  replies.  The root comment id is ``data.parentId`` when the triggering
+  comment is a reply, else ``data.id`` (the comment is itself the root).  The
+  session/chat_id is ``linear:<issueId>:<rootCommentId>`` so each thread on an
+  issue gets its own agent session (instead of all mentions collapsing onto the
+  issue) while still carrying the issueId needed for outbound posting.  A
+  legacy 2-part ``linear:<issueId>`` form (root_comment_id=None → top-level
+  comment) is still parsed for backward compatibility / proactive cron posts.
+
+Thread + issue context (ESC-290):
+  On every inbound mention the adapter does a GraphQL read-back
+  (``_fetch_thread_context``) of the issue (identifier, title, status,
+  trimmed description) and the ENTIRE comment thread (root + all replies,
+  chronological, including comments that precede the @escher-hermes mention)
+  so the agent never answers blind.  Read-back failures fall back to the
+  payload-only header + triggering comment and log a warning — the agent run
+  is never dropped.
 
 Outbound (send_message):
   POST https://api.linear.app/graphql
-  Mutation: commentCreate(input:{issueId, body})
+  Mutation: commentCreate(input:{issueId, body, parentId})
+  When the chat_id carries a root comment id, replies are threaded under it via
+  ``parentId`` (ESC-290); otherwise a top-level comment is posted.
   Header: Authorization: <LINEAR_API_KEY>  (no Bearer prefix)
   After reply: posts a one-line summary to Slack #escher-bulletins
 
+@-mention the action owner (ESC-290):
+  The triggering commenter's display name is surfaced in the prompt so the
+  agent can @-mention the human who needs to act when its reply asks a question
+  or assigns a next step.  The bot never @-mentions itself; an @human mention
+  in an outbound body does not change the webhook actor, so it cannot re-wake
+  the bot (the self-loop guard keys on actor identity).
+
 References:
   ESC-286 — Linear↔Hermes gateway platform adapter
+  ESC-290 — Thread-per-comment sessions, parentId threading, thread read-back
 """
 
 from __future__ import annotations
@@ -97,6 +127,27 @@ def check_requirements() -> bool:
     return AIOHTTP_AVAILABLE
 
 
+def _parse_chat_id(chat_id: str) -> tuple[str, Optional[str]]:
+    """Parse a Linear chat_id into ``(issue_id, root_comment_id)`` (ESC-290).
+
+    Accepts:
+      * ``linear:<issueId>:<rootCommentId>`` → (issueId, rootCommentId)  [threaded]
+      * ``linear:<issueId>``                 → (issueId, None)           [legacy/top-level]
+      * ``<issueId>``                        → (issueId, None)           [bare fallback]
+
+    Note the issueId itself is a UUID with no colons, so a simple 3-way split
+    is unambiguous.
+    """
+    if chat_id.startswith("linear:"):
+        rest = chat_id[len("linear:"):]
+    else:
+        rest = chat_id
+    parts = rest.split(":", 1)
+    issue_id = parts[0]
+    root_comment_id = parts[1] if len(parts) == 2 and parts[1] else None
+    return issue_id, root_comment_id
+
+
 def _validate_config(config: PlatformConfig) -> bool:
     """Config is valid when LINEAR_API_KEY is set (env or extra)."""
     return bool(
@@ -155,8 +206,12 @@ async def _post_linear_comment(
     issue_id: str,
     body: str,
     api_key: str,
+    parent_id: Optional[str] = None,
 ) -> dict:
     """Post a comment to a Linear issue via GraphQL.
+
+    When *parent_id* is set, the comment is threaded as a reply under that root
+    comment via ``parentId`` (ESC-290); when None, a top-level comment is posted.
 
     Returns a dict with ``success``, optionally ``comment_id``, ``comment_url``,
     or ``error``.
@@ -166,9 +221,11 @@ async def _post_linear_comment(
     except ImportError:
         return {"success": False, "error": "aiohttp not installed"}
 
+    # $parentId is nullable: passing null posts a top-level comment, so the same
+    # mutation serves both threaded replies and proactive top-level posts.
     mutation = """
-    mutation CreateComment($issueId: String!, $body: String!) {
-      commentCreate(input: {issueId: $issueId, body: $body}) {
+    mutation CreateComment($issueId: String!, $body: String!, $parentId: String) {
+      commentCreate(input: {issueId: $issueId, body: $body, parentId: $parentId}) {
         success
         comment {
           id
@@ -177,9 +234,12 @@ async def _post_linear_comment(
       }
     }
     """
+    variables: Dict[str, Any] = {"issueId": issue_id, "body": body}
+    if parent_id:
+        variables["parentId"] = parent_id
     payload = {
         "query": mutation,
-        "variables": {"issueId": issue_id, "body": body},
+        "variables": variables,
     }
     headers = {
         "Authorization": api_key,  # Linear uses raw key, NO "Bearer" prefix
@@ -220,6 +280,198 @@ async def _post_linear_comment(
         "comment_id": comment.get("id"),
         "comment_url": comment.get("url"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Inbound: GraphQL thread + issue read-back (ESC-290)
+# ---------------------------------------------------------------------------
+
+#: Trim issue descriptions to keep the injected context bounded.
+_DESCRIPTION_MAX_CHARS = 2000
+
+
+async def _fetch_thread_context(
+    issue_id: str,
+    root_comment_id: Optional[str],
+    api_key: str,
+) -> Optional[dict]:
+    """Read back the issue + full comment thread from Linear via GraphQL.
+
+    The webhook payload only carries the single triggering comment — not the
+    issue description/status nor the other comments in the thread.  This reads:
+      * issue: identifier, title, state.name, description (trimmed)
+      * thread: the root comment + ALL its replies (children), chronologically,
+        including comments that precede the @escher-hermes mention.
+
+    Returns a dict ``{issue: {...}, thread: [ {body, author, createdAt}, ... ]}``
+    or ``None`` on any failure (caller falls back to payload-only context).
+    """
+    try:
+        import aiohttp
+    except ImportError:
+        logger.warning("[linear] aiohttp not installed — skipping thread read-back")
+        return None
+
+    if not root_comment_id:
+        # Proactive / legacy posts have no thread to read back.
+        query = """
+        query IssueContext($issueId: String!) {
+          issue(id: $issueId) {
+            identifier
+            title
+            description
+            state { name }
+          }
+        }
+        """
+        variables: Dict[str, Any] = {"issueId": issue_id}
+    else:
+        query = """
+        query ThreadContext($issueId: String!, $commentId: String!) {
+          issue(id: $issueId) {
+            identifier
+            title
+            description
+            state { name }
+          }
+          comment(id: $commentId) {
+            id
+            body
+            createdAt
+            user { name displayName }
+            children {
+              nodes {
+                id
+                body
+                createdAt
+                user { name displayName }
+              }
+            }
+          }
+        }
+        """
+        variables = {"issueId": issue_id, "commentId": root_comment_id}
+
+    headers = {
+        "Authorization": api_key,  # raw key, NO "Bearer" prefix
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as session:
+            async with session.post(
+                LINEAR_GRAPHQL_URL,
+                headers=headers,
+                json={"query": query, "variables": variables},
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.warning(
+                        "[linear] Thread read-back HTTP %s: %s",
+                        resp.status, text[:200],
+                    )
+                    return None
+                data = await resp.json()
+    except Exception as exc:
+        logger.warning("[linear] Thread read-back request failed: %s", exc)
+        return None
+
+    if data.get("errors"):
+        errs = "; ".join(e.get("message", str(e)) for e in data["errors"])
+        logger.warning("[linear] Thread read-back GraphQL errors: %s", errs)
+        return None
+
+    gql = data.get("data") or {}
+    issue = gql.get("issue") or {}
+    if not issue:
+        logger.warning("[linear] Thread read-back returned no issue")
+        return None
+
+    description = (issue.get("description") or "")
+    if len(description) > _DESCRIPTION_MAX_CHARS:
+        description = description[:_DESCRIPTION_MAX_CHARS] + "…[truncated]"
+
+    out: Dict[str, Any] = {
+        "issue": {
+            "identifier": issue.get("identifier", ""),
+            "title": issue.get("title", ""),
+            "status": (issue.get("state") or {}).get("name", ""),
+            "description": description,
+        },
+        "thread": [],
+    }
+
+    def _author(node: dict) -> str:
+        user = node.get("user") or {}
+        return user.get("displayName") or user.get("name") or "Unknown"
+
+    root = gql.get("comment")
+    if root:
+        out["thread"].append({
+            "body": root.get("body", ""),
+            "author": _author(root),
+            "createdAt": root.get("createdAt", ""),
+        })
+        children = (root.get("children") or {}).get("nodes") or []
+        # Sort chronologically; createdAt is ISO-8601 so lexical sort is correct.
+        for child in sorted(children, key=lambda c: c.get("createdAt") or ""):
+            out["thread"].append({
+                "body": child.get("body", ""),
+                "author": _author(child),
+                "createdAt": child.get("createdAt", ""),
+            })
+
+    return out
+
+
+def _build_thread_prompt(
+    *,
+    issue_identifier: str,
+    issue_title: str,
+    commenter_name: str,
+    comment_body: str,
+    context: Optional[dict],
+) -> str:
+    """Assemble the agent prompt from the read-back context (ESC-290).
+
+    Layout: compact issue header (identifier, title, status) + trimmed
+    description, then the full thread so far, then the new triggering comment
+    highlighted.  Falls back to a payload-only header + triggering comment when
+    *context* is None (read-back failed).
+    """
+    if not context:
+        # Fallback: payload-only (legacy behavior) — agent still runs.
+        return (
+            f"[Linear issue {issue_identifier}: {issue_title}]\n\n"
+            f"{commenter_name} said:\n{comment_body}"
+        )
+
+    issue = context.get("issue", {})
+    identifier = issue.get("identifier") or issue_identifier
+    title = issue.get("title") or issue_title
+    status = issue.get("status") or ""
+    description = issue.get("description") or ""
+
+    parts = [f"[Linear issue {identifier}: {title}]"]
+    if status:
+        parts.append(f"Status: {status}")
+    if description:
+        parts.append(f"\nDescription:\n{description}")
+
+    thread = context.get("thread") or []
+    if thread:
+        lines = ["\nThread so far (chronological):"]
+        for c in thread:
+            lines.append(f"  {c.get('author', 'Unknown')}: {c.get('body', '')}")
+        parts.append("\n".join(lines))
+
+    parts.append(
+        f"\nNew comment from {commenter_name} (the person who triggered this — "
+        f"@-mention them if your reply needs their action):\n{comment_body}"
+    )
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +659,11 @@ class LinearAdapter(BasePlatformAdapter):
         comment_id: str = data.get("id", "")
         commenter_name: str = actor_name or "Unknown"
 
+        # Thread-per-comment session keying (ESC-290): Linear threads are one
+        # level deep, so the root comment is parentId (when this is a reply)
+        # else the comment's own id (when it is a top-level comment).
+        root_comment_id: str = data.get("parentId") or comment_id
+
         if not issue_id:
             logger.warning("[linear] Comment event missing issueId — ignoring")
             return web.json_response({"error": "Missing issueId"}, status=400)
@@ -417,8 +674,10 @@ class LinearAdapter(BasePlatformAdapter):
             "title": issue_title,
         }
 
-        # Build session source — keyed per issue so follow-ups keep context
-        session_chat_id = f"linear:{issue_id}"
+        # Session keyed per THREAD (issue + root comment) so distinct threads on
+        # one issue get distinct sessions; the issueId stays recoverable for the
+        # outbound commentCreate and the root id drives parentId threading.
+        session_chat_id = f"linear:{issue_id}:{root_comment_id}"
         source = self.build_source(
             chat_id=session_chat_id,
             chat_name=f"Linear/{issue_identifier}",
@@ -427,9 +686,18 @@ class LinearAdapter(BasePlatformAdapter):
             user_name=commenter_name,
         )
 
-        prompt = (
-            f"[Linear issue {issue_identifier}: {issue_title}]\n\n"
-            f"{commenter_name} said:\n{comment_body}"
+        # GraphQL read-back of the full thread + issue context so the agent
+        # never answers blind.  Resilient: on failure, _build_thread_prompt
+        # falls back to the payload-only header + triggering comment.
+        context = await _fetch_thread_context(
+            issue_id, root_comment_id, self._api_key
+        )
+        prompt = _build_thread_prompt(
+            issue_identifier=issue_identifier,
+            issue_title=issue_title,
+            commenter_name=commenter_name,
+            comment_body=comment_body,
+            context=context,
         )
 
         event = MessageEvent(
@@ -473,14 +741,12 @@ class LinearAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Post *content* as a Linear comment.
 
-        chat_id is ``linear:<issueId>`` (set in _handle_linear_webhook).
+        chat_id is ``linear:<issueId>:<rootCommentId>`` (set in
+        _handle_linear_webhook); the root comment id threads the reply via
+        parentId.  A legacy 2-part ``linear:<issueId>`` form posts a top-level
+        comment (ESC-290).
         """
-        # Extract issue_id from chat_id
-        if chat_id.startswith("linear:"):
-            issue_id = chat_id[len("linear:"):]
-        else:
-            # Fallback: treat chat_id as a raw issue ID
-            issue_id = chat_id
+        issue_id, root_comment_id = _parse_chat_id(chat_id)
 
         if not issue_id:
             logger.error("[linear] send() called with empty issue_id (chat_id=%r)", chat_id)
@@ -489,7 +755,9 @@ class LinearAdapter(BasePlatformAdapter):
         if not self._api_key:
             return SendResult(success=False, error="LINEAR_API_KEY not set")
 
-        result = await _post_linear_comment(issue_id, content, self._api_key)
+        result = await _post_linear_comment(
+            issue_id, content, self._api_key, parent_id=root_comment_id
+        )
 
         if result["success"]:
             logger.info(
@@ -555,13 +823,14 @@ async def _standalone_send(
     if not api_key:
         return {"error": "LINEAR_API_KEY not set"}
 
-    # chat_id may be "linear:<issueId>" or a bare issue ID
-    if chat_id.startswith("linear:"):
-        issue_id = chat_id[len("linear:"):]
-    else:
-        issue_id = chat_id
+    # chat_id may be 3-part "linear:<issueId>:<rootCommentId>" (threaded reply),
+    # 2-part "linear:<issueId>" (legacy/top-level), or a bare issue ID.  A
+    # proactive cron post with no root comment id posts a top-level comment.
+    issue_id, root_comment_id = _parse_chat_id(chat_id)
 
-    return await _post_linear_comment(issue_id, message, api_key)
+    return await _post_linear_comment(
+        issue_id, message, api_key, parent_id=root_comment_id
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +865,11 @@ def register(ctx) -> None:
         platform_hint=(
             "You are responding in a Linear issue comment thread. "
             "Use concise Markdown — Linear renders headers, bold, code blocks, "
-            "and bullet lists. Keep replies focused and actionable."
+            "and bullet lists. Keep replies focused and actionable. "
+            "When your reply asks a question or assigns a next step to a human, "
+            "@-mention the person who needs to act (by default the commenter who "
+            "triggered this) using @displayName. Do not @-mention yourself "
+            "(escher-hermes)."
         ),
     )
     logger.info("[linear] Platform adapter registered")

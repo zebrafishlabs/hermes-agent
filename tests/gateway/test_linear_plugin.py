@@ -38,6 +38,9 @@ _validate_linear_signature = _linear._validate_linear_signature
 _post_linear_comment = _linear._post_linear_comment
 _standalone_send = _linear._standalone_send
 _env_enablement = _linear._env_enablement
+_fetch_thread_context = _linear._fetch_thread_context
+_build_thread_prompt = _linear._build_thread_prompt
+_parse_chat_id = _linear._parse_chat_id
 _MENTION_RE = _linear._MENTION_RE
 _BOT_NAME = _linear._BOT_NAME
 _BOT_EMAIL = _linear._BOT_EMAIL
@@ -79,19 +82,45 @@ def _make_adapter(secret=_SECRET, api_key="lin_api_key"):
 
 def _comment_payload(body="@escher-hermes please help", actor_name="Chris",
                      actor_email="chris@imgix.com", issue_id="uuid-123",
-                     identifier="ESC-99", title="Test issue", event_type="Comment"):
+                     identifier="ESC-99", title="Test issue", event_type="Comment",
+                     parent_id=None, comment_id="comment-1"):
+    data = {
+        "id": comment_id,
+        "body": body,
+        "issueId": issue_id,
+        "issue": {"identifier": identifier, "title": title},
+    }
+    if parent_id is not None:
+        data["parentId"] = parent_id
     return {
         "type": event_type,
         "action": "create",
         "actor": {"id": "actor-1", "name": actor_name, "email": actor_email},
-        "data": {
-            "id": "comment-1",
-            "body": body,
-            "issueId": issue_id,
-            "issue": {"identifier": identifier, "title": title},
-        },
+        "data": data,
         "url": f"https://linear.app/escher-graphics/issue/{identifier}",
     }
+
+
+def _mock_graphql_session(*, status=200, json_body=None):
+    """Module-level mock aiohttp.ClientSession context manager.
+
+    Mirrors TestOutbound._mock_session for use by the read-back / thread tests.
+    Returns (session, post_mock).
+    """
+    resp = MagicMock()
+    resp.status = status
+    resp.json = AsyncMock(return_value=json_body or {})
+    resp.text = AsyncMock(return_value=json.dumps(json_body or {}))
+
+    post_ctx = MagicMock()
+    post_ctx.__aenter__ = AsyncMock(return_value=resp)
+    post_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    session = MagicMock()
+    session.post = MagicMock(return_value=post_ctx)
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+    return session, session.post
 
 
 def _signed_request(payload, secret=_SECRET):
@@ -256,7 +285,9 @@ class TestInboundHandler:
     def test_happy_path_dispatches_and_returns_202(self):
         adapter = _make_adapter()
         payload = _comment_payload(body="@escher-hermes status?")
-        with patch.object(adapter, "handle_message", new=AsyncMock()) as hm:
+        with patch.object(adapter, "handle_message", new=AsyncMock()) as hm, \
+             patch.object(_linear, "_fetch_thread_context",
+                          new=AsyncMock(return_value=None)):
             # let the create_task'd coroutine run
             resp = _run(adapter._handle_linear_webhook(_signed_request(payload)))
             _run(asyncio.sleep(0))
@@ -349,7 +380,8 @@ class TestOutbound:
             result = _run(adapter.send("linear:uuid-9", "Done.\nSecond line"))
         assert result.success is True
         assert result.message_id == "c2"
-        pc.assert_called_once_with("uuid-9", "Done.\nSecond line", "lin_api_key")
+        pc.assert_called_once_with("uuid-9", "Done.\nSecond line", "lin_api_key",
+                                   parent_id=None)
         # bulletin is a one-liner: "ESC-9 Foo: Done."
         sb.assert_called_once()
         bulletin = sb.call_args[0][0]
@@ -366,7 +398,7 @@ class TestOutbound:
         with patch.object(_linear, "_post_linear_comment",
                           new=AsyncMock(return_value={"success": True})) as pc:
             _run(_standalone_send(MagicMock(extra={}), "linear:uuid-x", "msg"))
-        pc.assert_called_once_with("uuid-x", "msg", "env_key")
+        pc.assert_called_once_with("uuid-x", "msg", "env_key", parent_id=None)
 
 
 # ---------------------------------------------------------------------------
@@ -449,3 +481,252 @@ class TestPluginShape:
     def test_env_enablement_none_without_api_key(self, monkeypatch):
         monkeypatch.delenv("LINEAR_API_KEY", raising=False)
         assert _env_enablement() is None
+
+
+# ---------------------------------------------------------------------------
+# 7. Thread-per-comment sessions + parentId threading (ESC-290)
+# ---------------------------------------------------------------------------
+
+class TestThreadSessions:
+    """Root-comment resolution and 3-part chat_id derivation."""
+
+    def test_top_level_comment_root_is_own_id(self):
+        # A top-level comment has no parentId -> root is the comment's own id.
+        adapter = _make_adapter()
+        payload = _comment_payload(body="@escher-hermes hi", comment_id="cmt-top")
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        with patch.object(adapter, "handle_message", new=_capture), \
+             patch.object(_linear, "_fetch_thread_context",
+                          new=AsyncMock(return_value=None)):
+            resp = _run(adapter._handle_linear_webhook(_signed_request(payload)))
+            _run(asyncio.sleep(0))
+        assert resp.status == 202
+        chat_id = captured["event"].source.chat_id
+        # root == own id since no parentId
+        assert chat_id == "linear:uuid-123:cmt-top"
+
+    def test_reply_comment_root_is_parent_id(self):
+        # A reply carries parentId -> root is the parent (the thread root).
+        adapter = _make_adapter()
+        payload = _comment_payload(body="@escher-hermes hi",
+                                   comment_id="cmt-reply", parent_id="cmt-root")
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        with patch.object(adapter, "handle_message", new=_capture), \
+             patch.object(_linear, "_fetch_thread_context",
+                          new=AsyncMock(return_value=None)):
+            resp = _run(adapter._handle_linear_webhook(_signed_request(payload)))
+            _run(asyncio.sleep(0))
+        assert resp.status == 202
+        chat_id = captured["event"].source.chat_id
+        assert chat_id == "linear:uuid-123:cmt-root"
+
+    def test_session_chat_id_contains_issue_and_root(self):
+        issue_id, root = _parse_chat_id("linear:uuid-123:cmt-root")
+        assert issue_id == "uuid-123"
+        assert root == "cmt-root"
+
+    def test_parse_legacy_two_part_chat_id(self):
+        issue_id, root = _parse_chat_id("linear:uuid-123")
+        assert issue_id == "uuid-123"
+        assert root is None
+
+    def test_parse_bare_issue_id(self):
+        issue_id, root = _parse_chat_id("uuid-123")
+        assert issue_id == "uuid-123"
+        assert root is None
+
+
+class TestParentIdThreading:
+    """commentCreate parentId variable handling + send() pass-through."""
+
+    def _mock_session(self, *, status=200, json_body=None):
+        return _mock_graphql_session(status=status, json_body=json_body)
+
+    def test_post_comment_includes_parent_id_when_given(self):
+        ok = {"data": {"commentCreate": {"success": True,
+              "comment": {"id": "c1", "url": "u"}}}}
+        session, post = self._mock_session(json_body=ok)
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = _run(_post_linear_comment("uuid-1", "hi", "api_key",
+                                               parent_id="root-c"))
+        assert result["success"] is True
+        _, kwargs = post.call_args
+        assert kwargs["json"]["variables"]["parentId"] == "root-c"
+        assert "$parentId" in kwargs["json"]["query"]
+
+    def test_post_comment_omits_parent_id_when_none(self):
+        ok = {"data": {"commentCreate": {"success": True,
+              "comment": {"id": "c1", "url": "u"}}}}
+        session, post = self._mock_session(json_body=ok)
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = _run(_post_linear_comment("uuid-1", "hi", "api_key"))
+        assert result["success"] is True
+        _, kwargs = post.call_args
+        # parentId omitted from variables -> GraphQL treats it as null (top-level)
+        assert "parentId" not in kwargs["json"]["variables"]
+
+    def test_send_three_part_chat_id_threads_under_root(self):
+        adapter = _make_adapter()
+        with patch.object(_linear, "_post_linear_comment",
+                          new=AsyncMock(return_value={"success": True,
+                                                      "comment_id": "c2"})) as pc, \
+             patch.object(_linear, "_post_slack_bulletin", new=AsyncMock()):
+            result = _run(adapter.send("linear:uuid-9:root-7", "Done."))
+        assert result.success is True
+        pc.assert_called_once_with("uuid-9", "Done.", "lin_api_key",
+                                   parent_id="root-7")
+
+    def test_send_legacy_two_part_chat_id_top_level(self):
+        adapter = _make_adapter()
+        with patch.object(_linear, "_post_linear_comment",
+                          new=AsyncMock(return_value={"success": True,
+                                                      "comment_id": "c2"})) as pc, \
+             patch.object(_linear, "_post_slack_bulletin", new=AsyncMock()):
+            result = _run(adapter.send("linear:uuid-9", "Done."))
+        assert result.success is True
+        pc.assert_called_once_with("uuid-9", "Done.", "lin_api_key",
+                                   parent_id=None)
+
+    def test_standalone_send_three_part_threads(self, monkeypatch):
+        monkeypatch.setenv("LINEAR_API_KEY", "env_key")
+        with patch.object(_linear, "_post_linear_comment",
+                          new=AsyncMock(return_value={"success": True})) as pc:
+            _run(_standalone_send(MagicMock(extra={}), "linear:uuid-x:root-y", "msg"))
+        pc.assert_called_once_with("uuid-x", "msg", "env_key", parent_id="root-y")
+
+
+class TestThreadReadback:
+    """GraphQL read-back of issue + full thread, and prompt assembly."""
+
+    def _readback_body(self):
+        return {"data": {
+            "issue": {
+                "identifier": "ESC-99",
+                "title": "Test issue",
+                "description": "The issue body explains the goal.",
+                "state": {"name": "In Progress"},
+            },
+            "comment": {
+                "id": "cmt-root",
+                "body": "Earlier pre-mention comment from a teammate.",
+                "createdAt": "2026-05-01T00:00:00Z",
+                "user": {"name": "Dana", "displayName": "Dana D"},
+                "children": {"nodes": [
+                    {"id": "cmt-reply",
+                     "body": "@escher-hermes please summarize",
+                     "createdAt": "2026-05-02T00:00:00Z",
+                     "user": {"name": "Chris", "displayName": "Chris C"}},
+                ]},
+            },
+        }}
+
+    def test_fetch_thread_context_parses_issue_and_thread(self):
+        session, _ = _mock_graphql_session(json_body=self._readback_body())
+        with patch("aiohttp.ClientSession", return_value=session):
+            ctx = _run(_fetch_thread_context("uuid-123", "cmt-root", "api_key"))
+        assert ctx["issue"]["status"] == "In Progress"
+        assert ctx["issue"]["identifier"] == "ESC-99"
+        bodies = [c["body"] for c in ctx["thread"]]
+        assert "Earlier pre-mention comment from a teammate." in bodies
+        assert "@escher-hermes please summarize" in bodies
+        # chronological: root first, then reply
+        assert ctx["thread"][0]["author"] == "Dana D"
+
+    def test_fetch_thread_context_trims_description(self):
+        body = self._readback_body()
+        body["data"]["issue"]["description"] = "x" * 5000
+        session, _ = _mock_graphql_session(json_body=body)
+        with patch("aiohttp.ClientSession", return_value=session):
+            ctx = _run(_fetch_thread_context("uuid-123", "cmt-root", "api_key"))
+        assert len(ctx["issue"]["description"]) < 5000
+        assert ctx["issue"]["description"].endswith("…[truncated]")
+
+    def test_inbound_prompt_includes_thread_and_status(self):
+        adapter = _make_adapter()
+        payload = _comment_payload(body="@escher-hermes please summarize",
+                                   comment_id="cmt-reply", parent_id="cmt-root",
+                                   actor_name="Chris")
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        session, _ = _mock_graphql_session(json_body=self._readback_body())
+        with patch.object(adapter, "handle_message", new=_capture), \
+             patch("aiohttp.ClientSession", return_value=session):
+            resp = _run(adapter._handle_linear_webhook(_signed_request(payload)))
+            _run(asyncio.sleep(0))
+        assert resp.status == 202
+        text = captured["event"].text
+        # issue header + status present
+        assert "ESC-99" in text
+        assert "In Progress" in text
+        # the pre-mention comment is included (not truncated at the mention)
+        assert "Earlier pre-mention comment from a teammate." in text
+        # the triggering comment is highlighted
+        assert "please summarize" in text
+        # commenter surfaced for @-mention guidance
+        assert "Chris" in text
+
+    def test_inbound_readback_failure_falls_back(self):
+        adapter = _make_adapter()
+        payload = _comment_payload(body="@escher-hermes help",
+                                   comment_id="cmt-x")
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        # _fetch_thread_context returns None (read-back failed) -> fallback.
+        with patch.object(adapter, "handle_message", new=_capture), \
+             patch.object(_linear, "_fetch_thread_context",
+                          new=AsyncMock(return_value=None)):
+            resp = _run(adapter._handle_linear_webhook(_signed_request(payload)))
+            _run(asyncio.sleep(0))
+        # Still dispatched an agent run despite read-back failure.
+        assert resp.status == 202
+        assert "event" in captured
+        text = captured["event"].text
+        assert "ESC-99" in text
+        assert "@escher-hermes help" in text
+
+    def test_fetch_thread_context_http_error_returns_none(self):
+        session, _ = _mock_graphql_session(status=500, json_body={})
+        with patch("aiohttp.ClientSession", return_value=session):
+            ctx = _run(_fetch_thread_context("uuid-123", "cmt-root", "api_key"))
+        assert ctx is None
+
+
+class TestMentionOwner:
+    """@human mention preserved outbound; self-loop guard still drops bot events."""
+
+    def test_at_human_mention_preserved_in_outbound_body(self):
+        ok = {"data": {"commentCreate": {"success": True,
+              "comment": {"id": "c1", "url": "u"}}}}
+        session, post = _mock_graphql_session(json_body=ok)
+        body = "@Chris C can you confirm the rollout window?"
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = _run(_post_linear_comment("uuid-1", body, "api_key",
+                                               parent_id="root-c"))
+        assert result["success"] is True
+        _, kwargs = post.call_args
+        # verbatim — the @human mention is not stripped or altered
+        assert kwargs["json"]["variables"]["body"] == body
+
+    def test_self_loop_guard_still_drops_bot_events(self):
+        # An @human mention in the bot's reply does not change the inbound
+        # actor; bot-actored events are still dropped (no re-wake loop).
+        adapter = _make_adapter()
+        payload = _comment_payload(actor_name=_BOT_NAME,
+                                   body="@Chris C done — over to you")
+        resp = _run(adapter._handle_linear_webhook(_signed_request(payload)))
+        assert resp.status == 200
+        assert _run(_body(resp))["reason"] == "self_loop"
