@@ -395,6 +395,21 @@ class WebhookAdapter(BasePlatformAdapter):
         self._reload_dynamic_routes()
 
         route_name = request.match_info.get("route_name", "")
+
+        # Order-independent plugin-route delegation (ESC-286): a platform plugin
+        # (e.g. Linear) may own a specific path under /webhooks/. The plugin
+        # registers its handler in _plugin_route_registry during its adapter's
+        # connect(). Because requests only arrive AFTER all platforms have
+        # finished connecting, checking the registry here at request time makes
+        # delegation independent of the order in which the webhook adapter vs.
+        # the plugin adapter connected — unlike mount-time injection, which
+        # requires the plugin to connect first. The mount-time loop in connect()
+        # is now just an optimization (a dedicated route node); this is the
+        # correctness guarantee.
+        plugin_handler = _plugin_route_registry.get(f"/webhooks/{route_name}")
+        if plugin_handler is not None:
+            return await plugin_handler(request)
+
         route_config = self._routes.get(route_name)
 
         if not route_config:

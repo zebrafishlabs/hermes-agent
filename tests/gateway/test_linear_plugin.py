@@ -395,6 +395,36 @@ class TestPluginShape:
         _run(adapter.disconnect())
         assert "/webhooks/linear-comments" not in _plugin_route_registry
 
+    def test_wildcard_delegates_to_plugin_route_regardless_of_connect_order(self):
+        """Order-independence (ESC-286): even if the webhook adapter built its
+        app BEFORE the linear plugin connected (so the mount-time injection
+        loop never saw the route), the generic /webhooks/{route_name} handler
+        must still delegate to the plugin handler at request time. This is the
+        correctness guarantee that mount-time injection alone does NOT provide.
+        """
+        from gateway.platforms.webhook import WebhookAdapter, _plugin_route_registry
+        from gateway.config import PlatformConfig
+
+        called = {}
+
+        async def fake_handler(request):
+            from aiohttp import web
+            called["hit"] = True
+            return web.json_response({"status": "linear-handled"}, status=202)
+
+        # Webhook adapter connected FIRST: registry is empty at mount time.
+        wh = WebhookAdapter(PlatformConfig(enabled=True, extra={"secret": "x"}))
+        # Linear plugin connects AFTER — registers its route now.
+        _plugin_route_registry["/webhooks/linear-comments"] = fake_handler
+        try:
+            req = _mock_request(body=b"{}")
+            req.match_info = {"route_name": "linear-comments"}
+            resp = _run(wh._handle_webhook(req))
+            assert called.get("hit") is True
+            assert resp.status == 202
+        finally:
+            _plugin_route_registry.pop("/webhooks/linear-comments", None)
+
     def test_env_enablement_seeds_extra(self, monkeypatch):
         monkeypatch.setenv("LINEAR_API_KEY", "k")
         monkeypatch.setenv("LINEAR_WEBHOOK_SECRET", "s")
