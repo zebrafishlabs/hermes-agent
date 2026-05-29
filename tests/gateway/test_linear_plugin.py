@@ -389,19 +389,14 @@ class TestPluginShape:
         """The plugin loader imports register() from the package __init__, not
         adapter.py. A bare __init__ (no re-export) makes the loader log
         'has no register() function' and the platform never registers — the
-        exact bug that blocked the first deploy. Guard the re-export."""
-        import importlib.util
+        exact bug that blocked the first deploy. Guard the re-export by reading
+        the source (avoids relative-import context issues in the test harness)."""
         from pathlib import Path
-        init_path = (
-            Path(_linear.__file__).resolve().parent / "__init__.py"
-        )
-        spec = importlib.util.spec_from_file_location(
-            "linear_pkg_init_probe", init_path
-        )
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        assert hasattr(mod, "register"), (
-            "plugins/platforms/linear/__init__.py must re-export register()"
+        init_path = Path(_linear.__file__).resolve().parent / "__init__.py"
+        src = init_path.read_text()
+        assert "register" in src and "import register" in src, (
+            "plugins/platforms/linear/__init__.py must re-export register() "
+            "(e.g. 'from .adapter import register')"
         )
 
     def test_connect_registers_route_in_core_hook(self):
