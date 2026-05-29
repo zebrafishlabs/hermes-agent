@@ -730,3 +730,133 @@ class TestMentionOwner:
         resp = _run(adapter._handle_linear_webhook(_signed_request(payload)))
         assert resp.status == 200
         assert _run(_body(resp))["reason"] == "self_loop"
+
+
+class TestThreadResolution:
+    """ESC-291: stay quiet in resolved threads; respond on open / re-open.
+
+    The thread's root comment carries ``resolvedAt`` — non-null ⇒ resolved
+    (suppress), null/absent ⇒ open or re-opened (respond).  Read-back failure
+    is fail-OPEN (respond), since resolution status is then indeterminate.
+    """
+
+    def _readback_body(self, *, resolved_at=None):
+        """Read-back payload with the root comment's resolvedAt set or cleared."""
+        return {"data": {
+            "issue": {
+                "identifier": "ESC-99",
+                "title": "Test issue",
+                "description": "The issue body explains the goal.",
+                "state": {"name": "In Progress"},
+            },
+            "comment": {
+                "id": "cmt-root",
+                "body": "Root comment of the thread.",
+                "createdAt": "2026-05-01T00:00:00Z",
+                "resolvedAt": resolved_at,
+                "user": {"name": "Dana", "displayName": "Dana D"},
+                "children": {"nodes": [
+                    {"id": "cmt-reply",
+                     "body": "@escher-hermes please help",
+                     "createdAt": "2026-05-02T00:00:00Z",
+                     "resolvedAt": None,
+                     "user": {"name": "Chris", "displayName": "Chris C"}},
+                ]},
+            },
+        }}
+
+    def _mention_payload(self):
+        return _comment_payload(body="@escher-hermes please help",
+                                comment_id="cmt-reply", parent_id="cmt-root",
+                                actor_name="Chris")
+
+    # --- _fetch_thread_context parses resolvedAt into the resolved bool ------
+
+    def test_fetch_context_resolved_true_when_resolvedAt_set(self):
+        body = self._readback_body(resolved_at="2026-05-03T00:00:00Z")
+        session, _ = _mock_graphql_session(json_body=body)
+        with patch("aiohttp.ClientSession", return_value=session):
+            ctx = _run(_fetch_thread_context("uuid-123", "cmt-root", "api_key"))
+        assert ctx["resolved"] is True
+
+    def test_fetch_context_resolved_false_when_resolvedAt_null(self):
+        body = self._readback_body(resolved_at=None)
+        session, _ = _mock_graphql_session(json_body=body)
+        with patch("aiohttp.ClientSession", return_value=session):
+            ctx = _run(_fetch_thread_context("uuid-123", "cmt-root", "api_key"))
+        assert ctx["resolved"] is False
+
+    # --- inbound gate: resolved suppresses, open/re-open dispatches ----------
+
+    def test_resolved_thread_suppresses_dispatch(self):
+        adapter = _make_adapter()
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        body = self._readback_body(resolved_at="2026-05-03T00:00:00Z")
+        session, _ = _mock_graphql_session(json_body=body)
+        with patch.object(adapter, "handle_message", new=_capture), \
+             patch("aiohttp.ClientSession", return_value=session):
+            resp = _run(adapter._handle_linear_webhook(
+                _signed_request(self._mention_payload())))
+            _run(asyncio.sleep(0))
+        # Agent NOT invoked; ignored with the resolved reason.
+        assert "event" not in captured
+        assert _run(_body(resp))["reason"] == "thread_resolved"
+
+    def test_open_thread_dispatches(self):
+        adapter = _make_adapter()
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        body = self._readback_body(resolved_at=None)
+        session, _ = _mock_graphql_session(json_body=body)
+        with patch.object(adapter, "handle_message", new=_capture), \
+             patch("aiohttp.ClientSession", return_value=session):
+            resp = _run(adapter._handle_linear_webhook(
+                _signed_request(self._mention_payload())))
+            _run(asyncio.sleep(0))
+        assert resp.status == 202
+        assert "event" in captured
+
+    def test_reopened_thread_dispatches(self):
+        # A re-opened thread is structurally identical to a never-resolved one
+        # (resolvedAt cleared back to null) — assert explicitly to document the
+        # re-open path uses the same gate with no special handling.
+        adapter = _make_adapter()
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        body = self._readback_body(resolved_at=None)  # was resolved, now re-opened
+        session, _ = _mock_graphql_session(json_body=body)
+        with patch.object(adapter, "handle_message", new=_capture), \
+             patch("aiohttp.ClientSession", return_value=session):
+            resp = _run(adapter._handle_linear_webhook(
+                _signed_request(self._mention_payload())))
+            _run(asyncio.sleep(0))
+        assert resp.status == 202
+        assert "event" in captured
+
+    def test_readback_failure_fails_open_and_dispatches(self):
+        # context is None (read-back failed) -> resolution indeterminate ->
+        # respond rather than silently swallow the mention.
+        adapter = _make_adapter()
+        captured = {}
+
+        async def _capture(event):
+            captured["event"] = event
+
+        with patch.object(adapter, "handle_message", new=_capture), \
+             patch.object(_linear, "_fetch_thread_context",
+                          new=AsyncMock(return_value=None)):
+            resp = _run(adapter._handle_linear_webhook(
+                _signed_request(self._mention_payload())))
+            _run(asyncio.sleep(0))
+        assert resp.status == 202
+        assert "event" in captured

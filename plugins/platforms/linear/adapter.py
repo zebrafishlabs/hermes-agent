@@ -18,6 +18,10 @@ Inbound flow:
          ├─ self-loop guard (actor.name / actor.email)
          ├─ mention filter (@escher-hermes regex)
          ├─ GraphQL read-back of the full thread + issue context
+         ├─ resolution gate (ESC-291): if the thread's root comment is resolved,
+         │    stay quiet even when mentioned; a re-opened thread (resolvedAt
+         │    cleared) is treated as open and the bot responds again. Fail-open
+         │    when the read-back is indeterminate.
          └─ handle_message() → per-THREAD agent session
 
 Thread-per-comment sessions (ESC-290):
@@ -57,6 +61,7 @@ Outbound (send_message):
 References:
   ESC-286 — Linear↔Hermes gateway platform adapter
   ESC-290 — Thread-per-comment sessions, parentId threading, thread read-back
+  ESC-291 — Resolution gate: stay quiet in resolved threads, respond on re-open
 """
 
 from __future__ import annotations
@@ -338,6 +343,7 @@ async def _fetch_thread_context(
             id
             body
             createdAt
+            resolvedAt
             user { name displayName }
             children {
               nodes {
@@ -401,6 +407,10 @@ async def _fetch_thread_context(
             "description": description,
         },
         "thread": [],
+        # ESC-291: thread resolution state, read from the root comment's
+        # resolvedAt below. Non-null resolvedAt ⇒ resolved (bot stays quiet);
+        # null/absent ⇒ open or re-opened (bot responds when mentioned).
+        "resolved": False,
     }
 
     def _author(node: dict) -> str:
@@ -409,6 +419,7 @@ async def _fetch_thread_context(
 
     root = gql.get("comment")
     if root:
+        out["resolved"] = bool(root.get("resolvedAt"))
         out["thread"].append({
             "body": root.get("body", ""),
             "author": _author(root),
@@ -692,6 +703,25 @@ class LinearAdapter(BasePlatformAdapter):
         context = await _fetch_thread_context(
             issue_id, root_comment_id, self._api_key
         )
+
+        # ESC-291: resolution gate. If the thread's root comment is resolved,
+        # the conversation is considered done — stay quiet even when mentioned.
+        # A re-opened thread has resolvedAt cleared (context["resolved"] False),
+        # so this naturally lets the bot back in with no extra logic.
+        # Fail-OPEN: if context is None the read-back failed and resolution
+        # status is indeterminate — respond rather than silently swallow a
+        # legitimate mention (suppression is a courtesy gate, not a security
+        # gate).
+        if context and context.get("resolved"):
+            logger.info(
+                "[linear] Thread resolved — suppressing reply for issue %s "
+                "(comment %s, root %s)",
+                issue_identifier, comment_id, root_comment_id,
+            )
+            return web.json_response(
+                {"status": "ignored", "reason": "thread_resolved"}
+            )
+
         prompt = _build_thread_prompt(
             issue_identifier=issue_identifier,
             issue_title=issue_title,
