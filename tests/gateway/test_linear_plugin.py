@@ -1,0 +1,407 @@
+"""Tests for the Linear platform-plugin adapter (ESC-286).
+
+Loaded via the ``_plugin_adapter_loader`` helper so this lives under
+``plugin_adapter_linear`` in ``sys.modules`` and cannot collide with
+sibling platform-plugin tests on the same xdist worker.
+
+Coverage:
+  - Linear-Signature HMAC-SHA256 validation (valid / bad / missing secret)
+  - Inbound handler: signature gate, self-loop guard, mention filter
+    (positive, negative, negative-lookahead @escher-hermes-fake), event-type
+    filter, missing-issueId guard, happy-path 202 dispatch
+  - Outbound: commentCreate GraphQL body/header shape, GraphQL-errors handling,
+    success path
+  - Plugin shape: register() wires the platform registry; the generic core
+    hook (_plugin_route_registry) in gateway/platforms/webhook.py mounts the
+    handler on the shared :8644 app.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from gateway.config import PlatformConfig
+from tests.gateway._plugin_adapter_loader import load_plugin_adapter
+
+_linear = load_plugin_adapter("linear")
+
+LinearAdapter = _linear.LinearAdapter
+check_requirements = _linear.check_requirements
+register = _linear.register
+_validate_linear_signature = _linear._validate_linear_signature
+_post_linear_comment = _linear._post_linear_comment
+_standalone_send = _linear._standalone_send
+_env_enablement = _linear._env_enablement
+_MENTION_RE = _linear._MENTION_RE
+_BOT_NAME = _linear._BOT_NAME
+_BOT_EMAIL = _linear._BOT_EMAIL
+LINEAR_SIG_HEADER = _linear.LINEAR_SIG_HEADER
+LINEAR_GRAPHQL_URL = _linear.LINEAR_GRAPHQL_URL
+
+_SECRET = "test-linear-signing-secret"
+
+
+def _run(coro):
+    return asyncio.get_event_loop().run_until_complete(coro)
+
+
+def _linear_signature(body: bytes, secret: str) -> str:
+    """Compute Linear-Signature: hex HMAC-SHA256 of the raw body."""
+    return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+def _mock_request(headers=None, body=b""):
+    """Lightweight mock aiohttp request (mirrors test_webhook_adapter)."""
+    req = MagicMock()
+    req.headers = headers or {}
+    req.method = "POST"
+
+    async def _read():
+        return body
+
+    req.read = _read
+    return req
+
+
+def _make_adapter(secret=_SECRET, api_key="lin_api_key"):
+    cfg = PlatformConfig(
+        enabled=True,
+        extra={"api_key": api_key, "webhook_secret": secret},
+    )
+    return LinearAdapter(cfg)
+
+
+def _comment_payload(body="@escher-hermes please help", actor_name="Chris",
+                     actor_email="chris@imgix.com", issue_id="uuid-123",
+                     identifier="ESC-99", title="Test issue", event_type="Comment"):
+    return {
+        "type": event_type,
+        "action": "create",
+        "actor": {"id": "actor-1", "name": actor_name, "email": actor_email},
+        "data": {
+            "id": "comment-1",
+            "body": body,
+            "issueId": issue_id,
+            "issue": {"identifier": identifier, "title": title},
+        },
+        "url": f"https://linear.app/escher-graphics/issue/{identifier}",
+    }
+
+
+def _signed_request(payload, secret=_SECRET):
+    raw = json.dumps(payload).encode()
+    sig = _linear_signature(raw, secret)
+    return _mock_request(headers={LINEAR_SIG_HEADER: sig}, body=raw)
+
+
+async def _body(resp):
+    """Extract the JSON dict from an aiohttp web.Response."""
+    return json.loads(resp.body.decode())
+
+
+# ---------------------------------------------------------------------------
+# 1. Platform enum + requirements
+# ---------------------------------------------------------------------------
+
+def test_platform_enum_resolves_via_plugin_scan():
+    from gateway.config import Platform
+    p = Platform("linear")
+    assert p.value == "linear"
+    assert Platform("linear") is p
+
+
+def test_check_requirements_true_when_aiohttp_available():
+    assert check_requirements() is True
+
+
+def test_check_requirements_false_without_aiohttp(monkeypatch):
+    monkeypatch.setattr(_linear, "AIOHTTP_AVAILABLE", False)
+    assert check_requirements() is False
+    monkeypatch.setattr(_linear, "AIOHTTP_AVAILABLE", True)
+
+
+# ---------------------------------------------------------------------------
+# 2. Signature validation
+# ---------------------------------------------------------------------------
+
+class TestSignatureValidation:
+
+    def test_valid_signature_passes(self):
+        body = b'{"hello":"world"}'
+        sig = _linear_signature(body, _SECRET)
+        assert _validate_linear_signature(body, _SECRET, sig) is True
+
+    def test_bad_signature_fails(self):
+        body = b'{"hello":"world"}'
+        assert _validate_linear_signature(body, _SECRET, "deadbeef") is False
+
+    def test_signature_over_different_body_fails(self):
+        sig = _linear_signature(b'{"a":1}', _SECRET)
+        assert _validate_linear_signature(b'{"a":2}', _SECRET, sig) is False
+
+    def test_empty_secret_fails_closed(self):
+        body = b'{"hello":"world"}'
+        sig = _linear_signature(body, _SECRET)
+        assert _validate_linear_signature(body, "", sig) is False
+
+    def test_empty_sig_header_fails_closed(self):
+        assert _validate_linear_signature(b"{}", _SECRET, "") is False
+
+    def test_uppercase_hex_signature_still_matches_via_strip_only(self):
+        # Linear sends lowercase hex; ensure we don't accidentally pass uppercase.
+        body = b'{"hello":"world"}'
+        sig = _linear_signature(body, _SECRET).upper()
+        # compare_digest is case-sensitive — uppercase must NOT validate.
+        assert _validate_linear_signature(body, _SECRET, sig) is False
+
+
+# ---------------------------------------------------------------------------
+# 3. Mention regex
+# ---------------------------------------------------------------------------
+
+class TestMentionRegex:
+
+    @pytest.mark.parametrize("text", [
+        "@escher-hermes help",
+        "hey @Escher-Hermes can you",
+        "ping @ESCHER-HERMES",
+        "trailing @escher-hermes.",
+        "@escher-hermes, please",
+    ])
+    def test_matches(self, text):
+        assert _MENTION_RE.search(text) is not None
+
+    @pytest.mark.parametrize("text", [
+        "plain comment no mention",
+        "talking about escher-hermes without at-sign",
+        "@escher-hermes-fake should not match",
+        "@escher-hermesbot extra chars",
+        "email escher-hermes+linear@imgix.com in prose",
+    ])
+    def test_no_match(self, text):
+        assert _MENTION_RE.search(text) is None
+
+
+# ---------------------------------------------------------------------------
+# 4. Inbound handler
+# ---------------------------------------------------------------------------
+
+class TestInboundHandler:
+
+    def test_bad_signature_returns_401(self):
+        adapter = _make_adapter()
+        payload = _comment_payload()
+        raw = json.dumps(payload).encode()
+        req = _mock_request(headers={LINEAR_SIG_HEADER: "wrong"}, body=raw)
+        resp = _run(adapter._handle_linear_webhook(req))
+        assert resp.status == 401
+
+    def test_missing_secret_returns_403(self):
+        adapter = _make_adapter(secret="")
+        payload = _comment_payload()
+        raw = json.dumps(payload).encode()
+        # even a "valid" sig can't help — secret unset means fail-closed
+        req = _mock_request(headers={LINEAR_SIG_HEADER: "anything"}, body=raw)
+        resp = _run(adapter._handle_linear_webhook(req))
+        assert resp.status == 403
+
+    def test_non_comment_event_ignored(self):
+        adapter = _make_adapter()
+        payload = _comment_payload(event_type="Issue")
+        resp = _run(adapter._handle_linear_webhook(_signed_request(payload)))
+        assert resp.status == 200
+        assert _run(_body(resp))["reason"] == "event_type"
+
+    def test_self_loop_guard_by_name(self):
+        adapter = _make_adapter()
+        payload = _comment_payload(actor_name=_BOT_NAME, actor_email="x@y.z")
+        resp = _run(adapter._handle_linear_webhook(_signed_request(payload)))
+        assert resp.status == 200
+        assert _run(_body(resp))["reason"] == "self_loop"
+
+    def test_self_loop_guard_by_email(self):
+        adapter = _make_adapter()
+        payload = _comment_payload(actor_name="Someone", actor_email=_BOT_EMAIL)
+        resp = _run(adapter._handle_linear_webhook(_signed_request(payload)))
+        assert resp.status == 200
+        assert _run(_body(resp))["reason"] == "self_loop"
+
+    def test_no_mention_ignored(self):
+        adapter = _make_adapter()
+        payload = _comment_payload(body="just a regular comment")
+        resp = _run(adapter._handle_linear_webhook(_signed_request(payload)))
+        assert resp.status == 200
+        assert _run(_body(resp))["reason"] == "no_mention"
+
+    def test_fake_mention_ignored(self):
+        adapter = _make_adapter()
+        payload = _comment_payload(body="@escher-hermes-fake hi")
+        resp = _run(adapter._handle_linear_webhook(_signed_request(payload)))
+        assert resp.status == 200
+        assert _run(_body(resp))["reason"] == "no_mention"
+
+    def test_missing_issue_id_returns_400(self):
+        adapter = _make_adapter()
+        payload = _comment_payload()
+        payload["data"]["issueId"] = ""
+        resp = _run(adapter._handle_linear_webhook(_signed_request(payload)))
+        assert resp.status == 400
+
+    def test_happy_path_dispatches_and_returns_202(self):
+        adapter = _make_adapter()
+        payload = _comment_payload(body="@escher-hermes status?")
+        with patch.object(adapter, "handle_message", new=AsyncMock()) as hm:
+            # let the create_task'd coroutine run
+            resp = _run(adapter._handle_linear_webhook(_signed_request(payload)))
+            _run(asyncio.sleep(0))
+        assert resp.status == 202
+        body = _run(_body(resp))
+        assert body["status"] == "accepted"
+        assert body["issue"] == "ESC-99"
+        hm.assert_called_once()
+        # the issue metadata should be cached for the outbound bulletin
+        assert adapter._issue_cache["uuid-123"]["identifier"] == "ESC-99"
+
+    def test_bad_json_returns_400(self):
+        adapter = _make_adapter()
+        raw = b"not json{"
+        sig = _linear_signature(raw, _SECRET)
+        req = _mock_request(headers={LINEAR_SIG_HEADER: sig}, body=raw)
+        resp = _run(adapter._handle_linear_webhook(req))
+        assert resp.status == 400
+
+
+# ---------------------------------------------------------------------------
+# 5. Outbound: commentCreate
+# ---------------------------------------------------------------------------
+
+class TestOutbound:
+
+    def _mock_session(self, *, status=200, json_body=None):
+        """Build a mock aiohttp.ClientSession context manager."""
+        resp = MagicMock()
+        resp.status = status
+        resp.json = AsyncMock(return_value=json_body or {})
+        resp.text = AsyncMock(return_value=json.dumps(json_body or {}))
+
+        post_ctx = MagicMock()
+        post_ctx.__aenter__ = AsyncMock(return_value=resp)
+        post_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        session = MagicMock()
+        session.post = MagicMock(return_value=post_ctx)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        return session, session.post
+
+    def test_comment_create_success_shape(self):
+        ok = {"data": {"commentCreate": {"success": True,
+              "comment": {"id": "c1", "url": "https://linear.app/c/c1"}}}}
+        session, post = self._mock_session(json_body=ok)
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = _run(_post_linear_comment("uuid-1", "hello", "api_key"))
+        assert result["success"] is True
+        assert result["comment_id"] == "c1"
+        assert result["comment_url"] == "https://linear.app/c/c1"
+        # Verify the GraphQL request shape
+        _, kwargs = post.call_args
+        assert kwargs["headers"]["Authorization"] == "api_key"  # no Bearer prefix
+        assert "Bearer" not in kwargs["headers"]["Authorization"]
+        assert kwargs["json"]["variables"] == {"issueId": "uuid-1", "body": "hello"}
+        assert "commentCreate" in kwargs["json"]["query"]
+
+    def test_comment_create_graphql_errors(self):
+        err = {"errors": [{"message": "Issue not found"}]}
+        session, _ = self._mock_session(json_body=err)
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = _run(_post_linear_comment("uuid-1", "hi", "api_key"))
+        assert result["success"] is False
+        assert "Issue not found" in result["error"]
+
+    def test_comment_create_http_error(self):
+        session, _ = self._mock_session(status=500, json_body={})
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = _run(_post_linear_comment("uuid-1", "hi", "api_key"))
+        assert result["success"] is False
+        assert "HTTP 500" in result["error"]
+
+    def test_comment_create_success_false(self):
+        body = {"data": {"commentCreate": {"success": False, "comment": None}}}
+        session, _ = self._mock_session(json_body=body)
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = _run(_post_linear_comment("uuid-1", "hi", "api_key"))
+        assert result["success"] is False
+
+    def test_send_posts_comment_and_bulletin(self):
+        adapter = _make_adapter()
+        adapter._issue_cache["uuid-9"] = {"identifier": "ESC-9", "title": "Foo"}
+        with patch.object(_linear, "_post_linear_comment",
+                          new=AsyncMock(return_value={"success": True,
+                                                      "comment_id": "c2",
+                                                      "comment_url": "u"})) as pc, \
+             patch.object(_linear, "_post_slack_bulletin", new=AsyncMock()) as sb:
+            result = _run(adapter.send("linear:uuid-9", "Done.\nSecond line"))
+        assert result.success is True
+        assert result.message_id == "c2"
+        pc.assert_called_once_with("uuid-9", "Done.\nSecond line", "lin_api_key")
+        # bulletin is a one-liner: "ESC-9 Foo: Done."
+        sb.assert_called_once()
+        bulletin = sb.call_args[0][0]
+        assert bulletin.startswith("ESC-9 Foo:")
+        assert "Second line" not in bulletin
+
+    def test_send_empty_issue_id_fails(self):
+        adapter = _make_adapter()
+        result = _run(adapter.send("linear:", "hi"))
+        assert result.success is False
+
+    def test_standalone_send_uses_api_key(self, monkeypatch):
+        monkeypatch.setenv("LINEAR_API_KEY", "env_key")
+        with patch.object(_linear, "_post_linear_comment",
+                          new=AsyncMock(return_value={"success": True})) as pc:
+            _run(_standalone_send(MagicMock(extra={}), "linear:uuid-x", "msg"))
+        pc.assert_called_once_with("uuid-x", "msg", "env_key")
+
+
+# ---------------------------------------------------------------------------
+# 6. Plugin shape + generic core hook
+# ---------------------------------------------------------------------------
+
+class TestPluginShape:
+
+    def test_register_calls_register_platform(self):
+        ctx = MagicMock()
+        register(ctx)
+        ctx.register_platform.assert_called_once()
+        kwargs = ctx.register_platform.call_args.kwargs
+        assert kwargs["name"] == "linear"
+        assert kwargs["label"] == "Linear"
+        assert "LINEAR_API_KEY" in kwargs["required_env"]
+        assert kwargs["standalone_sender_fn"] is _standalone_send
+
+    def test_connect_registers_route_in_core_hook(self):
+        from gateway.platforms.webhook import _plugin_route_registry
+        _plugin_route_registry.pop("/webhooks/linear-comments", None)
+        adapter = _make_adapter()
+        _run(adapter.connect())
+        assert "/webhooks/linear-comments" in _plugin_route_registry
+        # disconnect removes it (no stale-handler accumulation)
+        _run(adapter.disconnect())
+        assert "/webhooks/linear-comments" not in _plugin_route_registry
+
+    def test_env_enablement_seeds_extra(self, monkeypatch):
+        monkeypatch.setenv("LINEAR_API_KEY", "k")
+        monkeypatch.setenv("LINEAR_WEBHOOK_SECRET", "s")
+        out = _env_enablement()
+        assert out["api_key"] == "k"
+        assert out["webhook_secret"] == "s"
+
+    def test_env_enablement_none_without_api_key(self, monkeypatch):
+        monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+        assert _env_enablement() is None

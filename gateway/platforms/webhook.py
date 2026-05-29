@@ -68,6 +68,23 @@ DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
 
+# ---------------------------------------------------------------------------
+# Plugin route registry
+# ---------------------------------------------------------------------------
+# Platform plugins that need to mount a handler on the shared :8644 aiohttp
+# app (e.g. the Linear adapter for ``/webhooks/linear-comments``) add an
+# entry here during their ``register(ctx)`` call — before any WebhookAdapter
+# is instantiated.  ``WebhookAdapter.connect()`` reads this dict and mounts
+# the handlers alongside the generic ``/webhooks/{route_name}`` pattern,
+# giving the specific path priority.
+#
+# Key:   absolute URL path (str)  — e.g. ``"/webhooks/linear-comments"``
+# Value: async aiohttp request handler  — ``async (request) -> web.Response``
+#
+# This is a permanent, upstreamable extension point.  It requires no changes
+# to gateway/run.py or gateway/config.py.
+_plugin_route_registry: Dict[str, Any] = {}
+
 # Hostnames/IP literals that only serve connections originating on the same
 # machine. Anything else is treated as a public bind for safety-rail purposes.
 _LOOPBACK_HOSTS = frozenset({
@@ -110,6 +127,15 @@ class WebhookAdapter(BasePlatformAdapter):
         self._dynamic_routes_mtime: float = 0.0
         self._routes: Dict[str, dict] = dict(self._static_routes)
         self._runner = None
+
+        # Extra named POST route handlers that plugins can inject before
+        # connect() is called.  Keys are URL path strings (e.g.
+        # "/webhooks/linear-comments"); values are aiohttp request handlers
+        # ``async (request) -> web.Response``.  Mounted alongside the generic
+        # /webhooks/{route_name} pattern so the specific path takes priority.
+        # This is a permanent, upstreamable extension point — it lets platform
+        # plugins mount on the shared :8644 app without a second port.
+        self.extra_route_handlers: dict = {}
 
         # Delivery info keyed by session chat_id.
         #
@@ -184,6 +210,18 @@ class WebhookAdapter(BasePlatformAdapter):
 
         app = web.Application()
         app.router.add_get("/health", self._handle_health)
+        # Mount extra plugin-injected routes BEFORE the generic wildcard pattern
+        # so specific paths like /webhooks/linear-comments take priority.
+        for path, handler in self.extra_route_handlers.items():
+            app.router.add_post(path, handler)
+            logger.debug("[webhook] Mounted extra plugin route: POST %s", path)
+        # Also mount any routes registered via the module-level plugin registry
+        # (populated by plugins during their register(ctx) call, before adapters
+        # are created).
+        for path, handler in _plugin_route_registry.items():
+            if path not in self.extra_route_handlers:
+                app.router.add_post(path, handler)
+                logger.debug("[webhook] Mounted plugin-registry route: POST %s", path)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
 
         # Port conflict detection — fail fast if port is already in use

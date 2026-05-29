@@ -1,0 +1,35 @@
+name: linear-platform
+label: Linear
+kind: platform
+version: 1.0.0
+description: >
+  Linear gateway adapter for Hermes Agent.
+  Receives Linear webhook events via the shared :8644 ingress
+  (/webhooks/linear-comments), validates Linear-Signature HMAC-SHA256,
+  filters @escher-hermes mentions, and starts per-issue agent sessions.
+  Supports proactive comment posting via the Linear GraphQL API.
+author: Escher Engineering
+requires_env:
+  - name: LINEAR_API_KEY
+    description: "Linear personal API key (used as Authorization header without Bearer prefix)"
+    prompt: "Linear API key"
+    url: "https://linear.app/settings/api"
+    password: true
+  - name: LINEAR_WEBHOOK_SECRET
+    description: "HMAC secret for validating Linear-Signature header on incoming webhooks"
+    prompt: "Linear webhook signing secret"
+    url: "https://linear.app/settings/api"
+    password: true
+optional_env:
+  - name: LINEAR_HOME_CHANNEL
+    description: "Default Linear issue ID for cron / notification delivery (e.g. ESC-123)"
+    prompt: "Default Linear issue ID (optional)"
+    password: false
+  - name: LINEAR_ALLOW_ALL_USERS
+    description: "Allow any Linear user to trigger the bot (dev only; default false)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: LINEAR_ALLOWED_USERS
+    description: "Comma-separated Linear user IDs allowed to interact with the bot"
+    prompt: "Allowed user IDs (comma-separated)"
+    password: false
