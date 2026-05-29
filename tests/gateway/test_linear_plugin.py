@@ -376,7 +376,7 @@ class TestOutbound:
                           new=AsyncMock(return_value={"success": True,
                                                       "comment_id": "c2",
                                                       "comment_url": "u"})) as pc, \
-             patch.object(_linear, "_post_slack_bulletin", new=AsyncMock()) as sb:
+             patch.object(_linear, "_post_slack_summary", new=AsyncMock()) as sb:
             result = _run(adapter.send("linear:uuid-9", "Done.\nSecond line"))
         assert result.success is True
         assert result.message_id == "c2"
@@ -387,6 +387,30 @@ class TestOutbound:
         bulletin = sb.call_args[0][0]
         assert bulletin.startswith("ESC-9 Foo:")
         assert "Second line" not in bulletin
+
+    def test_summary_channel_defaults_to_escher_linear(self, monkeypatch):
+        monkeypatch.delenv("LINEAR_SLACK_CHANNEL", raising=False)
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+        sent = AsyncMock(return_value={"success": True})
+        with patch("tools.send_message_tool._send_slack", new=sent):
+            _run(_linear._post_slack_summary("ESC-1: hi"))
+        # default channel is #escher-linear
+        assert sent.call_args[0][1] == _linear._DEFAULT_SLACK_CHANNEL == "C0B6KMBPAGZ"
+
+    def test_summary_channel_env_override(self, monkeypatch):
+        monkeypatch.setenv("LINEAR_SLACK_CHANNEL", "C0OVERRIDE")
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+        sent = AsyncMock(return_value={"success": True})
+        with patch("tools.send_message_tool._send_slack", new=sent):
+            _run(_linear._post_slack_summary("ESC-1: hi"))
+        assert sent.call_args[0][1] == "C0OVERRIDE"
+
+    def test_summary_skipped_without_token(self, monkeypatch):
+        monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+        sent = AsyncMock()
+        with patch("tools.send_message_tool._send_slack", new=sent):
+            _run(_linear._post_slack_summary("ESC-1: hi"))
+        sent.assert_not_called()
 
     def test_send_empty_issue_id_fails(self):
         adapter = _make_adapter()
@@ -578,7 +602,7 @@ class TestParentIdThreading:
         with patch.object(_linear, "_post_linear_comment",
                           new=AsyncMock(return_value={"success": True,
                                                       "comment_id": "c2"})) as pc, \
-             patch.object(_linear, "_post_slack_bulletin", new=AsyncMock()):
+             patch.object(_linear, "_post_slack_summary", new=AsyncMock()):
             result = _run(adapter.send("linear:uuid-9:root-7", "Done."))
         assert result.success is True
         pc.assert_called_once_with("uuid-9", "Done.", "lin_api_key",
@@ -589,7 +613,7 @@ class TestParentIdThreading:
         with patch.object(_linear, "_post_linear_comment",
                           new=AsyncMock(return_value={"success": True,
                                                       "comment_id": "c2"})) as pc, \
-             patch.object(_linear, "_post_slack_bulletin", new=AsyncMock()):
+             patch.object(_linear, "_post_slack_summary", new=AsyncMock()):
             result = _run(adapter.send("linear:uuid-9", "Done."))
         assert result.success is True
         pc.assert_called_once_with("uuid-9", "Done.", "lin_api_key",

@@ -97,7 +97,10 @@ _BOT_EMAIL = "escher-hermes+linear@imgix.com"
 _MENTION_RE = re.compile(r"(?i)@escher-hermes(?![\w-])")
 
 #: Slack channel for awareness summaries after bot replies.
-_BULLETINS_CHANNEL = "C0B4FJWFBC3"
+#: Defaults to #escher-linear (the channel dedicated to Linear ticket
+#: activity); override with LINEAR_SLACK_CHANNEL. Resolved at call time so a
+#: gateway restart picks up env changes without a code edit.
+_DEFAULT_SLACK_CHANNEL = "C0B6KMBPAGZ"  # #escher-linear
 
 # ---------------------------------------------------------------------------
 # Lazy aiohttp guard
@@ -489,23 +492,28 @@ def _build_thread_prompt(
 # Outbound: Slack awareness summary
 # ---------------------------------------------------------------------------
 
-async def _post_slack_bulletin(message: str) -> None:
-    """Fire-and-forget: post a one-liner to #escher-bulletins.
+async def _post_slack_summary(message: str) -> None:
+    """Fire-and-forget: post a one-liner Linear-activity summary to Slack.
+
+    Target channel defaults to #escher-linear and is overridable via the
+    LINEAR_SLACK_CHANNEL env var (resolved here so a gateway restart picks up
+    env changes without a code edit).
 
     Reuses the same _send_slack helper as the rest of the gateway.
-    Errors are logged but never raised — the bulletin is best-effort.
+    Errors are logged but never raised — the summary is best-effort.
     """
     token = os.getenv("SLACK_BOT_TOKEN", "")
     if not token:
-        logger.debug("[linear] SLACK_BOT_TOKEN not set — skipping bulletin")
+        logger.debug("[linear] SLACK_BOT_TOKEN not set — skipping summary")
         return
+    channel = os.getenv("LINEAR_SLACK_CHANNEL", "") or _DEFAULT_SLACK_CHANNEL
     try:
         from tools.send_message_tool import _send_slack  # type: ignore[attr-defined]
-        result = await _send_slack(token, _BULLETINS_CHANNEL, message)
+        result = await _send_slack(token, channel, message)
         if not result.get("success"):
-            logger.warning("[linear] Slack bulletin failed: %s", result.get("error"))
+            logger.warning("[linear] Slack summary failed: %s", result.get("error"))
     except Exception as exc:
-        logger.warning("[linear] Slack bulletin error: %s", exc)
+        logger.warning("[linear] Slack summary error: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -806,7 +814,7 @@ class LinearAdapter(BasePlatformAdapter):
                 bulletin = f"{identifier} {title}: {summary}"
             else:
                 bulletin = f"{identifier}: {summary}"
-            await _post_slack_bulletin(bulletin)
+            await _post_slack_summary(bulletin)
         else:
             logger.error("[linear] commentCreate failed: %s", result.get("error"))
 
