@@ -2037,6 +2037,25 @@ def _refresh_qwen_cli_tokens(tokens: Dict[str, Any], timeout_seconds: float = 20
     return refreshed
 
 
+def _mark_qwen_oauth_active(creds: Dict[str, Any]) -> None:
+    """Set active_provider to qwen-oauth in auth.json.
+
+    Qwen OAuth tokens live in the Qwen CLI credential file managed by
+    _save_qwen_cli_tokens / resolve_qwen_runtime_credentials. This function
+    only writes a minimal provider-state entry (base_url for display) and
+    sets active_provider so that get_active_provider() and
+    _model_section_has_credentials() detect the provider for the setup wizard
+    and status commands.
+    """
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        state: Dict[str, Any] = {}
+        if creds.get("base_url"):
+            state["base_url"] = str(creds["base_url"])
+        _save_provider_state(auth_store, "qwen-oauth", state)
+        _save_auth_store(auth_store)
+
+
 def resolve_qwen_runtime_credentials(
     *,
     force_refresh: bool = False,
@@ -2099,6 +2118,24 @@ def get_qwen_auth_status() -> Dict[str, Any]:
 # uses to construct a GeminiCloudCodeClient instead of the default OpenAI SDK.
 # Actual HTTP traffic goes to https://cloudcode-pa.googleapis.com/v1internal:*.
 # =============================================================================
+
+def _mark_google_gemini_cli_active(creds: Dict[str, Any]) -> None:
+    """Set active_provider to google-gemini-cli in auth.json.
+
+    The actual OAuth tokens live in the Google credential file managed by
+    agent.google_oauth. This function only writes a minimal provider-state
+    entry (email for display) and sets active_provider so that
+    get_active_provider() and _model_section_has_credentials() detect the
+    provider for the setup wizard and status commands.
+    """
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        state: Dict[str, Any] = {}
+        if creds.get("email"):
+            state["email"] = str(creds["email"])
+        _save_provider_state(auth_store, "google-gemini-cli", state)
+        _save_auth_store(auth_store)
+
 
 def resolve_gemini_oauth_runtime_credentials(
     *,
@@ -3370,7 +3407,7 @@ def _sync_codex_pool_entries(
         entry["last_error_reset_at"] = None
 
 
-def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None) -> None:
+def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
     """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -3380,6 +3417,8 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None) -> None
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
         state["auth_mode"] = "chatgpt"
+        if label and str(label).strip():
+            state["label"] = str(label).strip()
         _save_provider_state(auth_store, "openai-codex", state)
         _sync_codex_pool_entries(auth_store, tokens, last_refresh)
         _save_auth_store(auth_store)
@@ -6126,55 +6165,57 @@ def _prompt_model_selection(
     _DIM = "\033[2m"
     _RESET = "\033[0m"
 
-    # Try arrow-key menu first, fall back to number input
+    # Try arrow-key menu first, fall back to number input.
+    # Uses the shared curses radiolist (ESC/arrow-key handling that works
+    # across terminals, incl. those that emit raw escape sequences) instead
+    # of simple_term_menu, which conflicts with /dev/tty and left ESC/arrow
+    # keys unreliable in the setup model picker.
     try:
-        from simple_term_menu import TerminalMenu
+        from hermes_cli.curses_ui import curses_radiolist
 
-        choices = [f"  {_label(mid)}" for mid in ordered]
-        choices.append("  Enter custom model name")
-        choices.append("  Skip (keep current)")
+        choices = [_label(mid) for mid in ordered]
+        choices.append("Enter custom model name")
+        choices.append("Skip (keep current)")
 
         _upgrade_url = (portal_url or DEFAULT_NOUS_PORTAL_URL).rstrip("/")
         unavailable_footer = unavailable_message.strip()
         if not unavailable_footer and _unavailable:
             unavailable_footer = f"Upgrade at {_upgrade_url} for paid models"
 
-        # Print the unavailable block BEFORE the menu via regular print().
-        # simple_term_menu pads title lines to terminal width (causes wrapping),
-        # so we keep the title minimal and use stdout for the static block.
-        # clear_screen=False means our printed output stays visible above.
+        # The pricing column header (and any unavailable-models block) is shown
+        # as a multi-line description above the list so it survives the curses
+        # screen clear. menu_title already embeds the aligned price header.
+        desc_lines: list[str] = []
+        if has_pricing:
+            # menu_title is "Select default model:\n<pad><header>  /Mtok"
+            # Keep only the header portion for the description.
+            header_part = menu_title.split("\n", 1)
+            if len(header_part) > 1:
+                desc_lines.extend(header_part[1].splitlines())
         if _unavailable:
-            print(menu_title)
-            print()
             for mid in _unavailable:
-                print(f"{_DIM}     {_label(mid)}{_RESET}")
-            print()
-            print(f"{_DIM}  ── {unavailable_footer} ──{_RESET}")
-            print()
-            effective_title = "Available free models:"
-        else:
-            effective_title = menu_title
+                desc_lines.append(f"   {_label(mid)}")
+            desc_lines.append(f"  ── {unavailable_footer} ──")
+        description = "\n".join(desc_lines) if desc_lines else None
 
-        menu = TerminalMenu(
+        idx = curses_radiolist(
+            "Select default model:",
             choices,
-            cursor_index=default_idx,
-            menu_cursor="-> ",
-            menu_cursor_style=("fg_green", "bold"),
-            menu_highlight_style=("fg_green",),
-            cycle_cursor=True,
-            clear_screen=False,
-            title=effective_title,
+            selected=default_idx,
+            cancel_returns=-1,
+            description=description,
+            searchable=True,
         )
-        idx = menu.show()
-        from hermes_cli.curses_ui import flush_stdin
-        flush_stdin()
-        if idx is None:
+        if idx < 0:
             return None
         print()
         if idx < len(ordered):
             return ordered[idx]
         elif idx == len(ordered):
-            custom = input("Enter model name: ").strip()
+            try:
+                custom = input("Enter model name: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return None
             return custom if custom else None
         return None
     except (ImportError, NotImplementedError, OSError, subprocess.SubprocessError):
