@@ -392,23 +392,25 @@ class TestOutbound:
         monkeypatch.delenv("LINEAR_SLACK_CHANNEL", raising=False)
         monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
         sent = AsyncMock(return_value={"success": True})
-        with patch("tools.send_message_tool._send_slack", new=sent):
+        with patch("tools.send_message_tool._registry_standalone_send", new=sent):
             _run(_linear._post_slack_summary("ESC-1: hi"))
-        # default channel is #escher-linear
-        assert sent.call_args[0][1] == _linear._DEFAULT_SLACK_CHANNEL == "C0B6KMBPAGZ"
+        # _registry_standalone_send(platform, pconfig, chat_id, message) —
+        # channel is the 3rd positional arg (index 2).
+        assert sent.call_args[0][0] == "slack"
+        assert sent.call_args[0][2] == _linear._DEFAULT_SLACK_CHANNEL == "C0B6KMBPAGZ"
 
     def test_summary_channel_env_override(self, monkeypatch):
         monkeypatch.setenv("LINEAR_SLACK_CHANNEL", "C0OVERRIDE")
         monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
         sent = AsyncMock(return_value={"success": True})
-        with patch("tools.send_message_tool._send_slack", new=sent):
+        with patch("tools.send_message_tool._registry_standalone_send", new=sent):
             _run(_linear._post_slack_summary("ESC-1: hi"))
-        assert sent.call_args[0][1] == "C0OVERRIDE"
+        assert sent.call_args[0][2] == "C0OVERRIDE"
 
     def test_summary_skipped_without_token(self, monkeypatch):
         monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
         sent = AsyncMock()
-        with patch("tools.send_message_tool._send_slack", new=sent):
+        with patch("tools.send_message_tool._registry_standalone_send", new=sent):
             _run(_linear._post_slack_summary("ESC-1: hi"))
         sent.assert_not_called()
 

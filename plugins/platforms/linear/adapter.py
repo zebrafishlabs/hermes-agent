@@ -605,8 +605,11 @@ async def _post_slack_summary(message: str) -> None:
     LINEAR_SLACK_CHANNEL env var (resolved here so a gateway restart picks up
     env changes without a code edit).
 
-    Reuses the same _send_slack helper as the rest of the gateway.
-    Errors are logged but never raised — the summary is best-effort.
+    Routes through the slack plugin's standalone_sender_fn via the platform
+    registry (``_registry_standalone_send``) — the legacy
+    ``tools.send_message_tool._send_slack`` helper moved into the slack plugin
+    as ``_standalone_send`` upstream (#41112). Errors are logged but never
+    raised — the summary is best-effort.
     """
     token = os.getenv("SLACK_BOT_TOKEN", "")
     if not token:
@@ -614,8 +617,8 @@ async def _post_slack_summary(message: str) -> None:
         return
     channel = os.getenv("LINEAR_SLACK_CHANNEL", "") or _DEFAULT_SLACK_CHANNEL
     try:
-        from tools.send_message_tool import _send_slack  # type: ignore[attr-defined]
-        result = await _send_slack(token, channel, message)
+        from tools.send_message_tool import _registry_standalone_send
+        result = await _registry_standalone_send("slack", None, channel, message)
         if not result.get("success"):
             logger.warning("[linear] Slack summary failed: %s", result.get("error"))
     except Exception as exc:
