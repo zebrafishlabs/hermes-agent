@@ -1,0 +1,38 @@
+name: sentry-platform
+label: Sentry
+kind: platform
+version: 1.0.0
+description: >
+  Sentry alert ingestion adapter for Hermes Agent.
+  Receives Sentry Internal-Integration alert webhooks via the shared :8644
+  ingress (/webhooks/sentry), validates the Sentry-Hook-Signature HMAC-SHA256
+  against the integration client secret, and starts a per-issue agent session
+  that triages the alert and posts to Slack (#escher-alerts). One-directional:
+  Sentry has no reply surface, so the agent's outbound actions (Slack post,
+  Linear ticket) flow through its own tools during the run; the adapter's
+  send() delivers the agent's triage write-up to the alerts channel.
+author: Escher Engineering
+requires_env:
+  - name: SENTRY_CLIENT_SECRET
+    description: "Sentry internal-integration Client Secret (signs the Sentry-Hook-Signature HMAC on inbound alert webhooks)"
+    prompt: "Sentry integration client secret"
+    url: "https://sentry.io/settings/developer-settings/"
+    password: true
+optional_env:
+  - name: SENTRY_AUTH_TOKEN
+    description: "Sentry internal-integration auth token (read-only API calls: pull stack traces, correlate releases). Read from ~/.hermes/secrets/sentry-token if unset."
+    prompt: "Sentry auth token (optional)"
+    url: "https://sentry.io/settings/developer-settings/"
+    password: true
+  - name: SENTRY_ALERTS_CHANNEL
+    description: "Slack channel ID for alert triage posts (default: #escher-alerts)"
+    prompt: "Slack channel ID for Sentry alerts (optional)"
+    password: false
+  - name: SENTRY_ORG_SLUG
+    description: "Sentry organization slug (default: imgix)"
+    prompt: "Sentry org slug (optional)"
+    password: false
+  - name: SENTRY_ALLOW_ALL_USERS
+    description: "Allow all (dev only; default true — alerts are system-originated, not user-gated)"
+    prompt: "Allow all? (true/false)"
+    password: false
