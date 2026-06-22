@@ -3858,7 +3858,6 @@ class TestCloseShortcut:
     @pytest.fixture
     def adapter(self):
         from gateway.config import PlatformConfig
-        from gateway.platforms.slack import SlackAdapter
 
         config = PlatformConfig(enabled=True, token="xoxb-test")
         adapter = SlackAdapter(config)
