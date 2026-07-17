@@ -1325,8 +1325,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             f"{fb_model} via {fb_provider}"
         )
         logger.info(
-            "Fallback activated: %s → %s (%s)",
+            "Fallback activated: %s → %s (%s) reason=%s",
             old_model, fb_model, fb_provider,
+            getattr(reason, "value", reason) or "unspecified",
         )
         return True
     except Exception as e:

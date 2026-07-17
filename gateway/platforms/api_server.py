@@ -3915,6 +3915,26 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
+        # Session continuation: when the caller passes a session_id and no
+        # explicit history, load the persisted conversation from state.db so
+        # consecutive runs against the same session keep context (the Chrome
+        # side-panel extension relies on this — it passes session_id on every
+        # run and expects the server to keep history).  Gated on API-key auth,
+        # mirroring the X-Hermes-Session-Id gate in chat_completions: without
+        # it, an unauthenticated client could read arbitrary session history
+        # by enumerating session IDs.
+        body_session_id = body.get("session_id")
+        if not conversation_history and body_session_id and self._api_key:
+            try:
+                db = self._ensure_session_db()
+                if db is not None and db.get_session(str(body_session_id)):
+                    conversation_history = db.get_messages_as_conversation(str(body_session_id))
+            except Exception as e:
+                logger.warning(
+                    "Failed to load session history for run session %s: %s",
+                    body_session_id, e,
+                )
+
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
         approval_session_key = gateway_session_key or session_id or run_id

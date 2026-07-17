@@ -527,3 +527,124 @@ class TestStopRun:
                 body = await events_resp.text()
                 # Stream should have received run.failed and closed
                 assert "run.failed" in body or "stream closed" in body
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/runs — session history continuation (side-panel / API clients)
+# ---------------------------------------------------------------------------
+
+
+class TestRunSessionHistory:
+    """When a run passes session_id, persisted history must be loaded so
+    consecutive runs against the same session keep context."""
+
+    def _mock_done_agent(self):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "done"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+        return mock_agent
+
+    async def _post_and_wait(self, cli, payload, headers=None):
+        resp = await cli.post("/v1/runs", json=payload, headers=headers or {})
+        data = await resp.json()
+        run_id = data["run_id"]
+        for _ in range(40):
+            status_resp = await cli.get(f"/v1/runs/{run_id}", headers=headers or {})
+            status = await status_resp.json()
+            if status.get("status") in {"completed", "failed"}:
+                break
+            await asyncio.sleep(0.05)
+        return status
+
+    @pytest.mark.asyncio
+    async def test_session_id_loads_persisted_history(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        stored = [
+            {"role": "user", "content": "earlier question"},
+            {"role": "assistant", "content": "earlier answer"},
+        ]
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {"id": "panel-1"}
+        mock_db.get_messages_as_conversation.return_value = list(stored)
+        headers = {"Authorization": "Bearer sk-secret"}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_ensure_session_db", return_value=mock_db), \
+                 patch.object(auth_adapter, "_create_agent") as mock_create:
+                mock_agent = self._mock_done_agent()
+                mock_create.return_value = mock_agent
+                status = await self._post_and_wait(
+                    cli, {"input": "follow-up", "session_id": "panel-1"}, headers,
+                )
+                assert status["status"] == "completed"
+                kwargs = mock_agent.run_conversation.call_args.kwargs
+                assert kwargs["conversation_history"] == stored
+                mock_db.get_messages_as_conversation.assert_called_once_with("panel-1")
+
+    @pytest.mark.asyncio
+    async def test_no_api_key_does_not_load_history(self, adapter):
+        """Unauthenticated deployments must not expose session history."""
+        app = _create_runs_app(adapter)
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {"id": "panel-1"}
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "secret"},
+        ]
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_ensure_session_db", return_value=mock_db), \
+                 patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = self._mock_done_agent()
+                mock_create.return_value = mock_agent
+                status = await self._post_and_wait(
+                    cli, {"input": "follow-up", "session_id": "panel-1"},
+                )
+                assert status["status"] == "completed"
+                kwargs = mock_agent.run_conversation.call_args.kwargs
+                assert kwargs["conversation_history"] == []
+                mock_db.get_messages_as_conversation.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_explicit_history_wins_over_persisted(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        explicit = [{"role": "user", "content": "explicit history"}]
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {"id": "panel-1"}
+        mock_db.get_messages_as_conversation.return_value = [
+            {"role": "user", "content": "persisted"},
+        ]
+        headers = {"Authorization": "Bearer sk-secret"}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_ensure_session_db", return_value=mock_db), \
+                 patch.object(auth_adapter, "_create_agent") as mock_create:
+                mock_agent = self._mock_done_agent()
+                mock_create.return_value = mock_agent
+                status = await self._post_and_wait(
+                    cli,
+                    {"input": "follow-up", "session_id": "panel-1",
+                     "conversation_history": explicit},
+                    headers,
+                )
+                assert status["status"] == "completed"
+                kwargs = mock_agent.run_conversation.call_args.kwargs
+                assert kwargs["conversation_history"] == explicit
+                mock_db.get_messages_as_conversation.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unknown_session_id_yields_empty_history(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = None
+        headers = {"Authorization": "Bearer sk-secret"}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_ensure_session_db", return_value=mock_db), \
+                 patch.object(auth_adapter, "_create_agent") as mock_create:
+                mock_agent = self._mock_done_agent()
+                mock_create.return_value = mock_agent
+                status = await self._post_and_wait(
+                    cli, {"input": "hello", "session_id": "brand-new"}, headers,
+                )
+                assert status["status"] == "completed"
+                kwargs = mock_agent.run_conversation.call_args.kwargs
+                assert kwargs["conversation_history"] == []
+                mock_db.get_messages_as_conversation.assert_not_called()
