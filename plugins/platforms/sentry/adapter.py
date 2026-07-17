@@ -316,13 +316,11 @@ def _build_triage_prompt(alert: dict, org_slug: str) -> str:
 
 async def _post_slack(channel: str, message: str) -> dict:
     """Post *message* to a Slack channel via the shared gateway helper."""
-    token = os.getenv("SLACK_BOT_TOKEN", "")
-    if not token:
-        logger.warning("[sentry] SLACK_BOT_TOKEN not set — cannot post alert")
-        return {"success": False, "error": "no SLACK_BOT_TOKEN"}
     try:
-        from tools.send_message_tool import _send_slack  # type: ignore[attr-defined]
-        return await _send_slack(token, channel, message)
+        # Route through the generic registry shim (#41112): upstream moved
+        # _send_slack into the slack plugin; the shim survives relocations.
+        from tools.send_message_tool import _registry_standalone_send
+        return await _registry_standalone_send("slack", None, channel, message)
     except Exception as exc:
         logger.warning("[sentry] Slack post error: %s", exc)
         return {"success": False, "error": str(exc)}
