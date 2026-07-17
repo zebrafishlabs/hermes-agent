@@ -44,6 +44,7 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "set_value",
                     "wait",
                     "list_apps",
+                    "list_windows",
                     "focus_app",
                 ],
                 "description": (
@@ -71,9 +72,29 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "description": (
                     "Optional. Limit capture/action to a specific app "
-                    "(by name, e.g. 'Safari' or 'Notepad', or bundle ID "
-                    "where the platform supports it). If omitted, operates "
-                    "on the frontmost app's window or the whole screen."
+                    "(by name, e.g. 'Safari', or bundle ID, "
+                    "'com.apple.Safari'). If omitted, operates on the "
+                    "frontmost app's window. Pass app='screen' (or "
+                    "'desktop') to capture the OS desktop/shell surface — "
+                    "e.g. to see the wallpaper or click the taskbar. Note: "
+                    "capture is per-window; a single image cannot span "
+                    "multiple monitors, so on a multi-screen setup capture "
+                    "one window or display at a time."
+                ),
+            },
+            "pid": {
+                "type": "integer",
+                "description": (
+                    "Optional exact process target for action='capture'. Pair "
+                    "with window_id when discovery cannot resolve an X11 app."
+                ),
+            },
+            "window_id": {
+                "type": "integer",
+                "description": (
+                    "Optional exact native window target for action='capture'. "
+                    "Pair with pid when an external cua-driver list_windows "
+                    "lookup has already identified the window."
                 ),
             },
             "max_elements": {
@@ -113,9 +134,9 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 "minItems": 2,
                 "maxItems": 2,
                 "description": (
-                    "Pixel coordinates [x, y] in logical screen space (as "
-                    "returned by capture width/height). Only use this if "
-                    "no element index is available."
+                    "Pixel coordinates [x, y] relative to the captured window "
+                    "screenshot (top-left origin). Only use this if no element "
+                    "index is available."
                 ),
             },
             "button": {
