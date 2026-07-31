@@ -17610,8 +17610,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Clear session-scoped dangerous-command approvals and /yolo state.
         self._clear_session_boundary_security_state(session_key)
 
-        # Drop the session entry (no fresh entry created).
-        self.session_store.close_session(session_key)
+        # Drop the session entry (no fresh entry created). Await through the
+        # AsyncSessionStore facade — close_session() does SQLite + fsync work
+        # and must not run on the event loop (enforced by
+        # test_async_session_store.py).
+        await self.async_session_store.close_session(session_key)
 
         # Fire plugin on_session_finalize hook (session boundary).
         try:
@@ -17654,22 +17657,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Adapter on_session_closed hook failed", exc_info=True)
 
         return EphemeralReply("Thread closed — next message starts a new session.")
-
-    async def _handle_profile_command(self, event: MessageEvent) -> str:
-        """Handle /profile — show active profile name and home directory."""
-        from hermes_constants import display_hermes_home
-        from hermes_cli.profiles import get_active_profile_name
-
-        display = display_hermes_home()
-        profile_name = get_active_profile_name()
-
-        lines = [
-            t("gateway.profile.header", profile=profile_name),
-            t("gateway.profile.home", home=display),
-        ]
-
-        return "\n".join(lines)
-
 
     def _check_slash_access(
         self, source: SessionSource, canonical_cmd: str
