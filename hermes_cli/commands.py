@@ -1258,7 +1258,11 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     /hermes update on Slack. Demoted to free the native slot /approvals now
 #     claims — without this entry /approvals tips the registry past the 50-cap
 #     and silently clamps /update off, breaking Telegram parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update"})
+#   - platform: [fork-carried, ESC-272] our /close command claims a native
+#     slot at the 50-cap; /platform is a low-frequency inspection command,
+#     reachable as /hermes platform on Slack. Without this entry the clamp
+#     drops /platform silently and breaks Telegram parity.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "platform"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
