@@ -367,7 +367,13 @@ class SentryAdapter(BasePlatformAdapter):
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # is_reconnect (ESC-695): matches the sibling-adapter contract — the
+        # gateway reconnect watcher passes is_reconnect=True on every retry.
+        # No first-connect-only work exists here: route registration is an
+        # idempotent dict write that MUST re-run on reconnect (disconnect()
+        # pops the route); no session/task/socket is opened. Flag tunes
+        # logging only.
         if not self._client_secret:
             logger.warning(
                 "[sentry] SENTRY_CLIENT_SECRET not set — inbound alerts will be "
@@ -377,8 +383,9 @@ class SentryAdapter(BasePlatformAdapter):
         from gateway.platforms.webhook import _plugin_route_registry
         _plugin_route_registry["/webhooks/sentry"] = self._handle_sentry_webhook
         logger.info(
-            "[sentry] Registered /webhooks/sentry handler "
+            "[sentry] %s /webhooks/sentry handler "
             "(mounted when webhook adapter starts). Alerts channel=%s org=%s",
+            "Re-registered" if is_reconnect else "Registered",
             self._alerts_channel, self._org_slug,
         )
         self._mark_connected()

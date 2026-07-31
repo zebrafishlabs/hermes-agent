@@ -671,7 +671,13 @@ class LinearAdapter(BasePlatformAdapter):
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # is_reconnect (ESC-695): matches the sibling-adapter contract — the
+        # gateway reconnect watcher passes is_reconnect=True on every retry.
+        # This adapter has NO first-connect-only work to skip: the route
+        # registration below is an idempotent dict write that MUST re-run on
+        # reconnect (disconnect() pops the route), and no session/task/socket
+        # is opened here. The flag only tunes logging.
         if not self._api_key:
             logger.error(
                 "[linear] LINEAR_API_KEY is not set — cannot connect"
@@ -694,8 +700,9 @@ class LinearAdapter(BasePlatformAdapter):
             self._handle_linear_webhook
         )
         logger.info(
-            "[linear] Registered /webhooks/linear-comments handler "
-            "(will be mounted when webhook adapter starts)"
+            "[linear] %s /webhooks/linear-comments handler "
+            "(will be mounted when webhook adapter starts)",
+            "Re-registered" if is_reconnect else "Registered",
         )
 
         self._mark_connected()
