@@ -428,31 +428,15 @@ class SentryAdapter(BasePlatformAdapter):
             )
 
         sig = request.headers.get(SENTRY_SIG_HEADER, "")
-        # TEMP (Sentry HMAC mismatch diag, 2026-06-04): capture ground truth on
-        # the next rejected request so we can see exactly where the digest
-        # diverges. REMOVE once signature verification is confirmed working.
         if not _validate_sentry_signature(raw_body, self._client_secret, sig):
-            try:
-                _computed = hmac.new(
-                    self._client_secret.encode("utf-8"), raw_body, hashlib.sha256
-                ).hexdigest()
-                _all_sig_headers = {
-                    k: v for k, v in request.headers.items()
-                    if "sign" in k.lower() or "hook" in k.lower()
-                }
-                logger.warning(
-                    "[sentry][DIAG] HMAC mismatch. body_len=%d secret_len=%d "
-                    "recv_sig=%r computed=%r resource=%r content_type=%r "
-                    "hook_headers=%r body_head=%r",
-                    len(raw_body), len(self._client_secret),
-                    sig, _computed,
-                    request.headers.get(SENTRY_RESOURCE_HEADER, ""),
-                    request.headers.get("Content-Type", ""),
-                    _all_sig_headers,
-                    raw_body[:120],
-                )
-            except Exception as _diag_exc:
-                logger.warning("[sentry][DIAG] diag logging failed: %s", _diag_exc)
+            # ESC-703: this rejection log is deliberately CONTENT-FREE.
+            # /webhooks/sentry is internet-reachable (Cloud Armor
+            # default-allow on /webhooks/*), so this branch runs on
+            # UNAUTHENTICATED input. Never log the request body, the
+            # computed digest (a chosen-plaintext oracle), the received
+            # signature, request headers, or len(self._client_secret).
+            # If failure visibility is needed, add a rate-limited COUNTER,
+            # not per-request detail. See tests/gateway/test_sentry_plugin_diag.py.
             logger.warning("[sentry] Invalid Sentry-Hook-Signature — rejecting")
             return web.json_response({"error": "Invalid signature"}, status=401)
 
