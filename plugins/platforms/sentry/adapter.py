@@ -389,6 +389,9 @@ class SentryAdapter(BasePlatformAdapter):
             self._alerts_channel, self._org_slug,
         )
         self._mark_connected()
+        # Upstream adapter contract: every connectable adapter invokes the
+        # plugin-handler factories from connect(); no native client here.
+        self._wire_plugin_handlers(None)
         return True
 
     async def disconnect(self) -> None:
