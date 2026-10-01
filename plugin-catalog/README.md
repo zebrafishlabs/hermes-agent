@@ -54,6 +54,16 @@ meaningful:
    validate` refuses these at admission (`desktop surface` check); a plugin
    that needs a capability the SDK lacks asks for an SDK hook instead of
    patching around it.
+9. **Dependency security policy is the plugin's.** Hermes's 14-day
+   `exclude-newer` quarantine covers Hermes's own dependencies only; a plugin's
+   `python_dependencies` / `pyproject.toml` install under the plugin's policy
+   (no quarantine, still inside Hermes's core constraints). Reviewers read the
+   dependency list at the pinned SHA: bare floors (`>=X` with no upper bound)
+   and floors on the newest release get a request for the oldest
+   API-compatible floor plus an upper bound, and authors are strongly
+   recommended to run their own release quarantine (`uv --exclude-newer` in
+   their CI) — see the developer guide's *Dependency security policy*. A
+   recent floor alone is not grounds to hold an entry.
 
 ## Entry schema
 
@@ -61,7 +71,9 @@ meaningful:
 name: example-plugin        # [a-z0-9_-]{1,64}, the catalog key
 repo: https://github.com/owner/repo   # https:// only
 sha: <40-hex commit sha>    # mandatory exact pin
-subdir: ""                  # optional path within the repo
+subdir: ""                  # optional; plain relative path inside the repo
+                            # ([A-Za-z0-9._/-]+ only: no '..', '.', empty
+                            # segments, absolute, or backslash forms)
 description: One-line description.
 maintainer: OwnerName
 tier: official              # official | community (default community)
