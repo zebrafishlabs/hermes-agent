@@ -1679,15 +1679,6 @@ class SlackAdapter(BasePlatformAdapter):
             await ack(response_type="ephemeral", text=t("platform.slack.slash.running", command=slash))
             await self._handle_slash_command(command)
 
-        # Message shortcut: "Close Hermes thread" (carried fork, ESC-272).
-        # Unlike slash commands, shortcuts carry full message context
-        # including ``thread_ts``, so we can close the exact thread the
-        # shortcut was invoked from.
-        @self._app.shortcut("close_hermes_thread")
-        async def handle_close_shortcut(ack, shortcut):
-            await ack()
-            await self._handle_close_shortcut(shortcut)
-
         # Approval buttons, slash-confirm buttons (tools/slash_confirm.py), feedback.
         for _action_id in self._APPROVAL_CHOICES:
             self._app.action(_action_id)(self._handle_approval_action)
@@ -6009,42 +6000,6 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("[Slack] Failed to fetch thread parent text: %s", exc)
             return ""
-
-    async def _handle_close_shortcut(self, payload: dict) -> None:
-        """Handle the 'Close Hermes thread' Slack message shortcut.
-
-        Compatibility bridge to the thread-tracker plugin. Unlike slash commands,
-        message shortcuts carry thread context. Closing the THR record never
-        ends or resets the Hermes conversation.
-        """
-        channel_id = (payload.get("channel") or {}).get("id", "")
-        user_id = (payload.get("user") or {}).get("id", "")
-        msg = payload.get("message") or {}
-        # If the message has a thread_ts, it's a reply — close that thread.
-        # If not, the message IS the thread parent — use its ts as thread_id.
-        thread_ts = msg.get("thread_ts") or msg.get("ts")
-        team_id = (payload.get("team") or {}).get("id", "")
-
-        if team_id and channel_id:
-            self._channel_team[channel_id] = team_id
-
-        is_dm = str(channel_id).startswith("D")
-        source = self.build_source(
-            chat_id=channel_id,
-            chat_type="dm" if is_dm else "group",
-            user_id=user_id,
-            thread_id=thread_ts,
-            scope_id=team_id,
-        )
-
-        event = MessageEvent(
-            text="/close",
-            message_type=MessageType.COMMAND,
-            source=source,
-            raw_message=payload,
-            message_id=thread_ts,
-        )
-        await self.handle_message(event)
 
     async def _collect_thread_root_images(
         self, channel_id: str, thread_ts: str, team_id: str = "") -> Tuple[List[str], List[str]]:

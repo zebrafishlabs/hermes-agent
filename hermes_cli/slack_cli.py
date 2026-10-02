@@ -32,8 +32,8 @@ def _build_full_manifest(
             "messages_tab_read_only_enabled": False},
         "bot_user": {"display_name": bot_name[:80], "always_online": True},
         "slash_commands": slack_app_manifest()["features"]["slash_commands"],
-        # Thread-tracker plugin (~/.hermes/plugins/escher_thread_tracker) message shortcuts:
-        # "Track thread" opens the capture modal; "Close Hermes thread" dispatches /close.
+        # Thread-tracker plugin (~/.hermes/plugins/escher_thread_tracker) message shortcuts; both
+        # handlers live in the plugin (ctx.register_platform_handler("slack", ...)), no core bridge.
         "shortcuts": [
             {
                 "name": "Track thread",
@@ -42,10 +42,10 @@ def _build_full_manifest(
                 "description": "Track this thread as a Linear THR ticket (name + optional next step).",
             },
             {
-                "name": "Close Hermes thread",
+                "name": "Untrack thread",
                 "type": "message",
-                "callback_id": "close_hermes_thread",
-                "description": "Close this thread’s tracked Linear ticket; preserve conversation history.",
+                "callback_id": "untrack_hermes_thread",
+                "description": "Stop tracking this thread (its THR ticket moves to Closed).",
             },
         ],
     }
