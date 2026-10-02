@@ -811,13 +811,21 @@ class GatewayModelCommandsMixin:
         (persists agent.service_tier, parity with /model)."""
         from agent.fast_mode import service_tier_word
         from gateway.run import _load_gateway_config, _resolve_gateway_model
+        from hermes_cli.model_switch import resolve_effective_model
         from hermes_cli.models import model_supports_fast_mode, model_supports_ultrafast
 
         # The /reasoning parser strips --global (any position) and normalizes unicode dashes.
         args, persist_global = self._parse_reasoning_command_args(event.get_command_args().strip().lower())
-        session_key = self._session_key_for_source(event.source)
+        source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
+        session_key = self._session_key_for_source(source)
+        # Validate the next turn's model, including /model pins restored after a restart.
+        await asyncio.to_thread(self._rehydrate_session_model_override, session_key)
         self._service_tier = self._resolve_session_service_tier(session_key=session_key)
-        model = _resolve_gateway_model(_load_gateway_config())
+        model = resolve_effective_model(
+            self._session_model_override(session_key),
+            self._channel_override(source.platform, source.chat_id, source.thread_id, source.parent_chat_id),
+            _resolve_gateway_model(_load_gateway_config()),
+        )
         if not model_supports_fast_mode(model):
             return t("gateway.fast.not_supported")
         ultrafast = model_supports_ultrafast(model)
