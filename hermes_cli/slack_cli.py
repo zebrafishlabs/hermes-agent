@@ -32,13 +32,13 @@ def _build_full_manifest(
             "messages_tab_read_only_enabled": False},
         "bot_user": {"display_name": bot_name[:80], "always_online": True},
         "slash_commands": slack_app_manifest()["features"]["slash_commands"],
-        # Carried fork (/close, ESC-272): message shortcut to end a session.
+        # Compatibility shortcut: dispatch /close to the thread-tracker plugin.
         "shortcuts": [
             {
                 "name": "Close Hermes thread",
                 "type": "message",
                 "callback_id": "close_hermes_thread",
-                "description": "End the Hermes session for this thread.",
+                "description": "Close this thread’s tracked Linear ticket; preserve conversation history.",
             },
         ],
     }

@@ -6013,9 +6013,9 @@ class SlackAdapter(BasePlatformAdapter):
     async def _handle_close_shortcut(self, payload: dict) -> None:
         """Handle the 'Close Hermes thread' Slack message shortcut.
 
-        Carried fork method (ESC-272). Unlike slash commands, message
-        shortcuts carry full message context including ``thread_ts``, so we
-        can close the exact thread the shortcut was invoked from.
+        Compatibility bridge to the thread-tracker plugin. Unlike slash commands,
+        message shortcuts carry thread context. Closing the THR record never
+        ends or resets the Hermes conversation.
         """
         channel_id = (payload.get("channel") or {}).get("id", "")
         user_id = (payload.get("user") or {}).get("id", "")
@@ -6034,6 +6034,7 @@ class SlackAdapter(BasePlatformAdapter):
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
             thread_id=thread_ts,
+            scope_id=team_id,
         )
 
         event = MessageEvent(
@@ -6044,19 +6045,6 @@ class SlackAdapter(BasePlatformAdapter):
             message_id=thread_ts,
         )
         await self.handle_message(event)
-
-    async def on_session_closed(
-        self, channel_id: str, thread_id: Optional[str]
-    ) -> None:
-        """Drop a check reaction on the thread parent when a session closes.
-
-        Carried fork method (ESC-272). Called from the close command handler
-        via the adapter lifecycle-hook helper. Best-effort — failures are
-        swallowed.
-        """
-        if not channel_id or not thread_id:
-            return
-        await self._add_reaction(channel_id, thread_id, "white_check_mark")
 
     async def _collect_thread_root_images(
         self, channel_id: str, thread_ts: str, team_id: str = "") -> Tuple[List[str], List[str]]:

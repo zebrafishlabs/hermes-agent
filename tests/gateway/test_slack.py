@@ -4027,6 +4027,7 @@ class TestCloseShortcut:
         assert ev.source.thread_id == "1234.5678"
         assert ev.source.chat_id == "C0123"
         assert ev.source.user_id == "U_USER"
+        assert ev.source.scope_id == "T_TEAM"
 
     @pytest.mark.asyncio
     async def test_thread_parent_payload_uses_message_ts_as_thread_id(self, adapter):
@@ -4049,26 +4050,6 @@ class TestCloseShortcut:
 
         assert len(captured) == 1
         assert captured[0].source.thread_id == "1234.5678"
-
-    @pytest.mark.asyncio
-    async def test_on_session_closed_adds_white_check_mark(self, adapter):
-        """The adapter override drops a ✅ reaction on the thread parent."""
-        adapter._add_reaction = AsyncMock(return_value=True)
-
-        await adapter.on_session_closed("C0123", "1234.5678")
-
-        adapter._add_reaction.assert_awaited_once_with(
-            "C0123", "1234.5678", "white_check_mark"
-        )
-
-    @pytest.mark.asyncio
-    async def test_on_session_closed_no_thread_is_noop(self, adapter):
-        """Without a thread_id (channel-level close), no reaction is posted."""
-        adapter._add_reaction = AsyncMock()
-
-        await adapter.on_session_closed("C0123", None)
-
-        adapter._add_reaction.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

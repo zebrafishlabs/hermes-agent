@@ -384,8 +384,8 @@ _SLACK_RESERVED_COMMANDS = frozenset({
 _SLACK_VIA_HERMES_ONLY = frozenset({
     "topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat",
     "refine", "review", "pause", "whoami", "platform", "insights", "login",
-    # [fork-carried] /close (ESC-272) consumes one of Slack's 50 native slots; route the
-    # low-frequency /codex-runtime via /hermes so /usage keeps its native slash.
+    # Reserve native capacity for fork plugins; low-frequency /codex-runtime
+    # remains reachable via /hermes without displacing /usage.
     "codex-runtime"})
 
 
@@ -396,14 +396,19 @@ def _sanitize_slack_name(raw: str) -> str:
 
 def slack_native_slashes() -> list[tuple[str, str, str]]:
     """(slash_name, description, usage_hint) triples for Slack: every gateway-available command
-    (canonical names first so they win slots at the cap, then aliases, then plugins) becomes a
+    (compatibility-pinned /close plugin first, then canonical names, aliases, and other plugins) becomes a
     standalone slash, deduped and clamped to the 50-command cap; Slack built-ins and
     _SLACK_VIA_HERMES_ONLY are skipped. ``/hermes`` is always first for anything dropped."""
     available = _gateway_available_commands()
-    wanted = [(cmd.name, cmd.describe(), cmd.args_hint or "") for cmd in available]
+    plugin_entries = _iter_plugin_command_entries()
+    # /close was already deployed as a native slash in this fork. Keep that slot
+    # when its ownership moves to the tracker plugin, rather than losing it at
+    # Slack's cap behind aliases. No plugin loaded means no reserved command.
+    wanted = [(name, desc, hint or "") for name, desc, hint in plugin_entries if name == "close"]
+    wanted += [(cmd.name, cmd.describe(), cmd.args_hint or "") for cmd in available]
     wanted += [(alias, t("slash.shared.slack_alias_for", name=cmd.name, description=cmd.describe()),
                 cmd.args_hint or "") for cmd in available for alias in cmd.aliases]
-    wanted += [(name, desc, hint or "") for name, desc, hint in _iter_plugin_command_entries()]
+    wanted += [(name, desc, hint or "") for name, desc, hint in plugin_entries if name != "close"]
 
     entries: list[tuple[str, str, str]] = [
         ("hermes", t("slash.hermes.description"), "[subcommand] [args]")]

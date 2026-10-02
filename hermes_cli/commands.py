@@ -87,8 +87,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("new", "Start a new session (fresh session ID + history)", "Session",
                aliases=("reset",), args_hint="[name]",
                busy_policy="interrupt_then_dispatch", busy_handler="new"),
-    CommandDef("close", "End the current session for this channel/thread", "Session",
-               busy_policy="interrupt_then_dispatch", busy_handler="close"),  # carried fork, ESC-272
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
                gateway_only=True, args_hint="[off|help|session-id]"),
     CommandDef("clear", "Clear screen and start a new session", "Session",

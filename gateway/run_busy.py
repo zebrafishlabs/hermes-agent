@@ -950,8 +950,7 @@ class GatewayBusySessionMixin:
 
     # busy_handler key (hermes_cli/commands.py CommandDef) → mid-run variant ``_busy_<key>_command``.
     _BUSY_SPECIAL_HANDLERS: Dict[str, str] = {
-        # "close" = carried fork command (ESC-272)
-        k: f"_busy_{k}_command" for k in ("start", "stop", "new", "close", "queue", "steer", "egress", "goal", "loop")
+        k: f"_busy_{k}_command" for k in ("start", "stop", "new", "queue", "steer", "egress", "goal", "loop")
     }
 
     async def _dispatch_busy_slash_command(self, event: MessageEvent, cmd_def, quick_key: str, source):
@@ -1035,121 +1034,6 @@ class GatewayBusySessionMixin:
             quick_key, source, interrupt_reason=_INTERRUPT_REASON_RESET, invalidation_reason="new_command",
         )
         return await self._handle_reset_command(event)
-
-    async def _busy_close_command(self, event: MessageEvent, quick_key: str, source):
-        # Carried fork command (ESC-272): /close mirrors /new's
-        # interrupt-then-dispatch pattern — the close handler must run even
-        # if an agent is mid-flight so the session is actually torn down.
-        from gateway.run import _INTERRUPT_REASON_RESET
-        await self._interrupt_and_clear_session(
-            quick_key,
-            source,
-            interrupt_reason=_INTERRUPT_REASON_RESET,
-            invalidation_reason="close_command",
-        )
-        return await self._handle_close_command(event)
-
-    async def _handle_close_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
-        """Handle /close — end the current session without rotating in a fresh one.
-
-        Carried fork command (ESC-272). Mirrors the tear-down ladder from
-        the reset path but, instead of calling ``reset_session()`` (which
-        immediately creates a fresh ``SessionEntry``), calls
-        ``close_session()`` to drop the entry entirely. The next message in
-        this channel/thread will create a brand-new session from scratch.
-        """
-        source = event.source
-        session_key = self._session_key_for_source(source)
-        self._invalidate_session_run_generation(session_key, reason="session_close")
-
-        # Snapshot the old entry for hook payloads before close_session()
-        # removes it from the store.
-        old_entry = self.session_store._entries.get(session_key)
-
-        # Close tool resources on the agent (terminal sandboxes, browser
-        # daemons, background processes) before evicting from cache.
-        _cache_lock = getattr(self, "_agent_cache_lock", None)
-        if _cache_lock is not None:
-            with _cache_lock:
-                _cached = self._agent_cache.get(session_key)
-                _old_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
-            if _old_agent is not None:
-                self._cleanup_agent_resources(_old_agent)
-        self._evict_cached_agent(session_key)
-
-        # Discard any /queue overflow for this session.
-        _qe = getattr(self, "_queued_events", None)
-        if _qe is not None:
-            _qe.pop(session_key, None)
-
-        try:
-            from tools.env_passthrough import clear_env_passthrough
-            clear_env_passthrough()
-        except Exception:
-            pass
-
-        try:
-            from tools.credential_files import clear_credential_files
-            clear_credential_files()
-        except Exception:
-            pass
-
-        # Clear session-scoped overrides and pending notes.
-        self._session_model_overrides.pop(session_key, None)
-        self._set_session_reasoning_override(session_key, None)
-        if hasattr(self, "_pending_model_notes"):
-            self._pending_model_notes.pop(session_key, None)
-
-        # Clear session-scoped dangerous-command approvals and /yolo state.
-        self._clear_session_boundary_security_state(session_key)
-
-        # Drop the session entry (no fresh entry created). Await through the
-        # AsyncSessionStore facade — close_session() does SQLite + fsync work
-        # and must not run on the event loop (enforced by
-        # test_async_session_store.py).
-        await self.async_session_store.close_session(session_key)
-
-        # Fire plugin on_session_finalize hook (session boundary).
-        try:
-            from hermes_cli.plugins import invoke_hook as _invoke_hook
-            _old_sid = old_entry.session_id if old_entry else None
-            _invoke_hook("on_session_finalize", session_id=_old_sid,
-                         platform=source.platform.value if source.platform else "")
-        except Exception:
-            pass
-
-        # Emit session:end hook (session is ending).
-        await self.hooks.emit("session:end", {
-            "platform": source.platform.value if source.platform else "",
-            "user_id": source.user_id,
-            "session_key": session_key,
-        })
-
-        # Emit session:closed hook — Slack adapter (and any other adapter
-        # that cares) listens for this to drop a reaction on the thread
-        # parent so the user can see at-a-glance that the thread is closed.
-        await self.hooks.emit("session:closed", {
-            "platform": source.platform.value if source.platform else "",
-            "user_id": source.user_id,
-            "session_key": session_key,
-            "channel_id": source.chat_id,
-            "thread_id": source.thread_id,
-        })
-
-        # Notify the originating adapter directly so it can perform any
-        # platform-specific finalization (Slack drops a reaction on the
-        # thread parent). Done via the lifecycle-hook helper so a failing
-        # adapter never breaks the close flow.
-        adapter = self.adapters.get(source.platform) if source.platform else None
-        if adapter is not None:
-            try:
-                await adapter._run_processing_hook(
-                    "on_session_closed", source.chat_id, source.thread_id,
-                )
-            except Exception:
-                logger.debug("Adapter on_session_closed hook failed", exc_info=True)
-
-        return EphemeralReply("Thread closed — next message starts a new session.")
 
     async def _busy_queue_command(self, event: MessageEvent, quick_key: str, source):
         # Each /queue is its own full agent turn, run FIFO after the current run; never merged.
