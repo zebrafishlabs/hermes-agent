@@ -93,6 +93,42 @@ def _build_full_manifest(
             "token_rotation_enabled": False}}
 
 
+def merge_manifest_into(existing: dict, generated: dict, *, brand: str | None = None) -> dict:
+    """Overlay the generated command surface onto an EXISTING app manifest.
+
+    Preserves the installed app's identity and permissions verbatim (display_information, bot_user,
+    app_home, settings, any extra top-level keys); replaces only ``features.slash_commands`` and
+    ``features.shortcuts``; unions ``oauth_config.scopes.*`` and ``settings.event_subscriptions.
+    bot_events`` so a re-paste never silently drops a granted scope. ``brand`` rewrites the word
+    "Hermes" to the brand in command/shortcut descriptions and usage hints only — never in command
+    names or callback ids, so ``/hermes`` (the harness) keeps its name."""
+    import copy
+    merged = copy.deepcopy(existing)
+    gen_features = generated.get("features", {})
+    features = merged.setdefault("features", {})
+
+    def _brand(text: str) -> str:
+        return text.replace("Hermes", brand) if brand else text
+
+    features["slash_commands"] = [
+        {**cmd, "description": _brand(cmd.get("description", "")),
+         **({"usage_hint": _brand(cmd["usage_hint"])} if cmd.get("usage_hint") else {})}
+        for cmd in gen_features.get("slash_commands", [])]
+    features["shortcuts"] = [
+        {**sc, "name": _brand(sc.get("name", "")), "description": _brand(sc.get("description", ""))}
+        for sc in gen_features.get("shortcuts", [])]
+
+    scopes = merged.setdefault("oauth_config", {}).setdefault("scopes", {})
+    for kind, wanted in generated.get("oauth_config", {}).get("scopes", {}).items():
+        scopes[kind] = sorted(set(scopes.get(kind, [])) | set(wanted))
+    events = merged.setdefault("settings", {}).setdefault("event_subscriptions", {})
+    events["bot_events"] = sorted(
+        set(events.get("bot_events", []))
+        | set(generated.get("settings", {}).get("event_subscriptions", {}).get("bot_events", [])))
+    merged["settings"].setdefault("interactivity", {"is_enabled": True})
+    return merged
+
+
 def slack_manifest_command(args) -> int:
     """Print or write a Slack app manifest JSON (flags documented in ``hermes_cli/main.py``)."""
     name = getattr(args, "name", None) or "Hermes"
@@ -130,6 +166,10 @@ def slack_manifest_command(args) -> int:
     else:
         messaging_experience = "assistant"
 
+    merge_into = getattr(args, "merge_into", None)
+    brand = getattr(args, "brand", None)
+    if slashes_only and merge_into is not None:
+        return fail("--merge-into cannot be used with --slashes-only")
     if slashes_only:
         from hermes_cli.commands_platforms import slack_app_manifest
         manifest = slack_app_manifest()["features"]["slash_commands"]
@@ -137,6 +177,16 @@ def slack_manifest_command(args) -> int:
         manifest = _build_full_manifest(
             name, description, messaging_experience=messaging_experience,
             long_description=long_description)
+        if merge_into is not None:
+            try:
+                existing = json.loads(Path(merge_into).expanduser().read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeError, ValueError) as exc:
+                return fail(f"cannot read existing manifest {merge_into}: {exc}")
+            if not isinstance(existing, dict):
+                return fail(f"existing manifest {merge_into} is not a JSON object")
+            manifest = merge_manifest_into(existing, manifest, brand=brand)
+        elif brand:
+            manifest = merge_manifest_into(manifest, manifest, brand=brand)
     payload = json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
 
     write_target = getattr(args, "write", None)

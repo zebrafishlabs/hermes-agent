@@ -154,3 +154,53 @@ class TestSlackFullManifest:
             assert event in bot_events
 
 
+
+
+class TestMergeInto:
+    """``--merge-into`` overlays the command surface onto an installed app's manifest."""
+
+    def _existing(self):
+        return {
+            "display_information": {"name": "Escher", "description": "Manages the Escher project.",
+                                    "background_color": "#131c34"},
+            "features": {"bot_user": {"display_name": "Escher", "always_online": True},
+                         "shortcuts": [{"name": "Old", "type": "message", "callback_id": "old"}],
+                         "slash_commands": [{"command": "/stale", "description": "x"}],
+                         "assistant_view": {"assistant_description": "Chat with Escher."}},
+            "oauth_config": {"scopes": {"bot": ["pins:write", "chat:write"]}, "pkce_enabled": False},
+            "settings": {"event_subscriptions": {"bot_events": ["app_mention"]},
+                         "socket_mode_enabled": True, "is_mcp_enabled": False},
+        }
+
+    def test_identity_and_granted_permissions_survive_and_surface_is_replaced(self):
+        from hermes_cli.slack_cli import _build_full_manifest, merge_manifest_into
+        generated = _build_full_manifest("Hermes", "Your Hermes agent on Slack")
+        merged = merge_manifest_into(self._existing(), generated, brand="Escher")
+        assert merged["display_information"]["name"] == "Escher"
+        assert merged["display_information"]["background_color"] == "#131c34"
+        assert merged["features"]["bot_user"]["display_name"] == "Escher"
+        assert merged["features"]["assistant_view"]["assistant_description"] == "Chat with Escher."
+        assert merged["settings"]["is_mcp_enabled"] is False
+        assert merged["oauth_config"]["pkce_enabled"] is False
+        # unions, never drops
+        bot_scopes = set(merged["oauth_config"]["scopes"]["bot"])
+        assert {"pins:write", "chat:write"} <= bot_scopes
+        assert set(generated["oauth_config"]["scopes"]["bot"]) <= bot_scopes
+        assert {"app_mention"} | set(generated["settings"]["event_subscriptions"]["bot_events"]) \
+            <= set(merged["settings"]["event_subscriptions"]["bot_events"])
+        # command surface replaced wholesale
+        commands = {c["command"] for c in merged["features"]["slash_commands"]}
+        assert "/stale" not in commands and "/hermes" in commands
+        assert {s["callback_id"] for s in merged["features"]["shortcuts"]} == \
+            {s["callback_id"] for s in generated["features"]["shortcuts"]}
+
+    def test_brand_rewrites_descriptions_but_never_command_names(self):
+        from hermes_cli.slack_cli import _build_full_manifest, merge_manifest_into
+        generated = _build_full_manifest("Hermes", "Your Hermes agent on Slack")
+        merged = merge_manifest_into(self._existing(), generated, brand="Escher")
+        texts = [c["description"] + c.get("usage_hint", "") for c in merged["features"]["slash_commands"]]
+        texts += [s["name"] + s["description"] for s in merged["features"]["shortcuts"]]
+        assert not any("Hermes" in t for t in texts)
+        assert any(c["command"] == "/hermes" for c in merged["features"]["slash_commands"])
+        names = [c["command"] for c in generated["features"]["slash_commands"]]
+        assert [c["command"] for c in merged["features"]["slash_commands"]] == names

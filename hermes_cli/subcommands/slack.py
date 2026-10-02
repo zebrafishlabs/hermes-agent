@@ -35,6 +35,15 @@ def build_slack_parser(subparsers, *, cmd_slack: Callable) -> None:
         "--long-description-file", default=None, metavar="PATH",
         help=("Read Slack's long app description from a UTF-8 text file (175-4,000 characters)."))
     slack_manifest.add_argument(
+        "--merge-into", default=None, metavar="PATH",
+        help="Overlay the generated slash commands + shortcuts onto an EXISTING app manifest "
+        "(exported from api.slack.com). Keeps its identity, settings and granted scopes "
+        "(scopes/events are unioned, never removed); only the command surface is replaced.")
+    slack_manifest.add_argument(
+        "--brand", default=None, metavar="NAME",
+        help='Rewrite "Hermes" to NAME in command/shortcut descriptions (names such as /hermes '
+        "are never renamed).")
+    slack_manifest.add_argument(
         "--slashes-only", action="store_true",
         help="Emit only the features.slash_commands array (for merging "
         "into an existing manifest manually).")
