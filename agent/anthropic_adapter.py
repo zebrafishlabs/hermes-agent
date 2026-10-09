@@ -583,7 +583,8 @@ def _apply_claude_code_identity(system, anthropic_tools, anthropic_messages, to_
 def _thinking_kwargs(reasoning_config: Dict[str, Any], model: str, effective_max_tokens: int) -> Dict[str, Any]:
     """Map ``reasoning_config`` to Anthropic thinking kwargs. Adaptive models (Claude 4.6+,
     Kimi/Moonshot) get ``thinking.type=adaptive`` + ``output_config.effort``; older models and
-    manual-only compat endpoints (MiniMax) get budget_tokens. Haiku has no extended thinking. On
+    manual-only compat endpoints (MiniMax) get budget_tokens. Pre-5 Haiku gets no thinking; Haiku
+    5.5 is adaptive (``budget_tokens`` 400s there) and takes the adaptive branch. On
     4.7+ ``thinking.display`` defaults to "omitted", hiding the reasoning Hermes shows in its CLI,
     so "summarized" is requested to keep the activity feed populated."""
     if reasoning_config.get("enabled") is False:
@@ -591,7 +592,9 @@ def _thinking_kwargs(reasoning_config: Dict[str, Any], model: str, effective_max
         # silently keeps paying. Mandatory-thinking models 400 on the disable, so they keep the
         # omission: a silently-ignored disable beats a dead turn.
         return {"thinking": {"type": "disabled"}} if _accepts_thinking_disable(model) else {}
-    if "haiku" in model.lower():
+    # TEMP(upstream #134761): carried cherry-pick until NousResearch/hermes-agent#134761 merges —
+    # Haiku 5.5 is adaptive-thinking; pre-5 Haiku keeps the no-thinking path.
+    if "haiku" in model.lower() and not _supports_adaptive_thinking(model):
         return {}
     effort = str(reasoning_config.get("effort", "medium")).lower()
     if _supports_adaptive_thinking(model):
