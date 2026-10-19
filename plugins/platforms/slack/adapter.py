@@ -4971,8 +4971,10 @@ class SlackAdapter(BasePlatformAdapter):
         waiting agent thread — same mechanism as the text ``/approve`` flow."""
 
         def _build() -> tuple[str, list]:
+            request_id = (prompt.metadata or {}).get("approval_request_id")
+            value = json.dumps({"session_key": prompt.session_key, "request_id": request_id}) if request_id else prompt.session_key
             actions = [
-                self._button(label, self._EA_ACTION_IDS[choice], prompt.session_key, style=style)
+                self._button(label, self._EA_ACTION_IDS[choice], value, style=style)
                 for label, choice, style in prompt.actions]
             blocks = [
                 {"type": "section", "text": {"type": "mrkdwn", "text": prompt.text}},
@@ -5542,7 +5544,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _finalize_interactive_message(
         self, channel_id: str, msg_ts: str, original_text: str, decision_text: str,
-        placeholder: str, label: str, team_id: Optional[str] = None, sanitize: bool = True) -> None:
+        placeholder: str, label: str, team_id: Optional[str] = None, sanitize: bool = True) -> bool:
         """Rewrite a button prompt to show the outcome and drop the buttons."""
         updated_blocks = [
             {"type": "section", "text": {"type": "mrkdwn", "text": original_text or placeholder}},
@@ -5551,8 +5553,10 @@ class SlackAdapter(BasePlatformAdapter):
             await self._get_client(channel_id, team_id=team_id).chat_update(
                 channel=channel_id, ts=msg_ts, text=decision_text,
                 blocks=sanitize_blocks(updated_blocks) if sanitize else updated_blocks)
+            return True
         except Exception as e:
             logger.warning("[Slack] Failed to update %s message: %s", label, e)
+            return False
 
     # Button action_id → choice, and choice → outcome text (``{user}`` = clicker's name).
     _APPROVAL_CHOICES: ClassVar[dict[str, str]] = {
@@ -5630,7 +5634,11 @@ class SlackAdapter(BasePlatformAdapter):
         # timeout (count == 0) shows "expired", not "approved".
         try:
             from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(session_key, choice)
+            target = json.loads(session_key)
+            if not isinstance(target, dict) or not isinstance(target.get("session_key"), str) or not isinstance(target.get("request_id"), str) or not target["request_id"]:
+                raise ValueError("Approval button lacks an exact request identity")
+            session_key = target["session_key"]
+            count = resolve_gateway_approval(session_key, choice, request_id=target["request_id"], source="slack")
             logger.info(
                 "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)", count,
                 session_key, choice, user_name)
@@ -5643,6 +5651,20 @@ class SlackAdapter(BasePlatformAdapter):
         await self._finalize_interactive_message(
             channel_id, msg_ts, self._section_text(message), decision_text,
             "Command approval request", "approval", team_id or None)
+
+    async def retire_exec_approval(self, chat_id: str, message_id: str, command: str,
+                                   notice: str, metadata: Optional[dict[str, Any]] = None) -> bool:
+        """Retire a card settled by another trusted approval surface (ESC-415)."""
+        if self._outbound_blocked(chat_id, "approval card edit in"):
+            return False
+        team_id = self._metadata_team_id(metadata)
+        # Invalidate clicks before the network edit; identity-bound values also
+        # prevent an old card from granting a different queued request.
+        self._approval_resolved.pop(self._workspace_message_marker(team_id, message_id), None)
+        self._approval_resolved.pop(message_id, None)
+        return await self._finalize_interactive_message(
+            chat_id, message_id, self.format_message(f"```\n{command}\n```")[:2700],
+            notice, "Command approval request", "external approval", team_id or None)
 
     async def _update_clarify_message(
         self, channel_id: str, msg_ts: str, question_text: str, decision_text: str) -> None:

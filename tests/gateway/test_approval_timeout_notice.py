@@ -19,7 +19,7 @@ class _Runner:
 
 def _capture_settle(monkeypatch):
     hooks = {}
-    monkeypatch.setattr("tools.approval.register_gateway_settle", lambda sk, rid, fn: hooks.__setitem__(rid, fn))
+    monkeypatch.setattr("tools.approval.register_gateway_settle", lambda sk, rid, fn, **kw: hooks.__setitem__(rid, fn))
     return hooks
 
 
@@ -60,3 +60,31 @@ async def test_text_prompt_is_never_edited_in_place():
     assert [kind for kind, _ in calls] == ["send"]
     await settle_mod._post_timeout_notice(ctx, "ls", "card-9", 300)
     assert ("edit", "card-9") in calls
+
+
+@pytest.mark.parametrize('choice',['once','deny'])
+def test_duo_resolution_schedules_card_retirement(monkeypatch,choice):
+    hooks=_capture_settle(monkeypatch)
+    runner=_Runner(current=True)
+    settle_mod.register_timeout_notice(runner,{'request_id':'r-duo'},command='test',card_message_id='card-duo')
+    hooks['r-duo']('resolved',choice=choice,source='duo')
+    assert runner.scheduled==['External approval card update scheduling error']
+
+
+def test_slack_resolution_keeps_existing_click_feedback(monkeypatch):
+    hooks=_capture_settle(monkeypatch)
+    runner=_Runner(current=True)
+    settle_mod.register_timeout_notice(runner,{'request_id':'r-slack'},command='test',card_message_id='card-slack')
+    hooks['r-slack']('resolved',choice='once',source='slack')
+    assert runner.scheduled==[]
+
+
+@pytest.mark.asyncio
+async def test_external_resolution_updates_only_original_card():
+    calls=[]
+    class Adapter:
+        async def retire_exec_approval(self,chat_id,message_id,command,notice,metadata=None):
+            calls.append((chat_id,message_id,command,notice,metadata))
+    ctx=SimpleNamespace(_status_adapter=Adapter(),_status_chat_id='channel',_status_thread_metadata={'thread_id':'thread'})
+    await settle_mod._post_external_resolution(ctx,'test-only','card-original','once')
+    assert calls==[('channel','card-original','test-only','Approved via Duo',{'thread_id':'thread'})]

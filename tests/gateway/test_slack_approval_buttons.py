@@ -1,6 +1,7 @@
 """Tests for Slack Block Kit approval buttons and thread context fetching."""
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -167,7 +168,7 @@ class TestSlackApprovalAction:
             "channel": {"id": "C1"},
             "user": {"name": "alice", "id": "U_ALICE"},
         }
-        action = {"action_id": "hermes_approve_once", "value": "session-key"}
+        action = {"action_id": "hermes_approve_once", "value": json.dumps({"session_key":"session-key","request_id":"request-a"})}
 
         mock_client = adapter._team_clients["T1"]
         mock_client.chat_update = AsyncMock()

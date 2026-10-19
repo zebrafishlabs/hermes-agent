@@ -39,19 +39,39 @@ def register_timeout_notice(
         return
     timeout_s = approval_timeout_seconds()
 
-    def settle(reason: str) -> None:
-        if reason != "timeout":
+    def settle(reason: str, *, choice=None, source=None) -> None:
+        external = reason == "resolved" and source == "duo" and choice in ("once", "session", "always", "deny")
+        if reason != "timeout" and not external:
             return  # answered / interrupted / notify_failed already produced their own feedback
         # Same guard as every other late notice in TurnRunner: after /stop, /new or a restart the
         # turn is over and this chat belongs to a newer run — do not edit or post into it.
         still_current = getattr(runner._ctx, "_run_still_current", None)
         if callable(still_current) and not still_current():
             return
+        if external:
+            runner._schedule(
+                _post_external_resolution(runner._ctx, command, card_message_id, str(choice)),
+                "External approval card update scheduling error")
+            return
         runner._schedule(
             _post_timeout_notice(runner._ctx, command, card_message_id, timeout_s),
             "Approval timeout notice scheduling error")
 
-    register_gateway_settle(session_key, request_id, settle)
+    register_gateway_settle(session_key, request_id, settle, with_outcome=True)
+
+
+async def _post_external_resolution(ctx, command: str, card_message_id: Optional[str], choice: str) -> None:
+    """Retire the original card, never post another approval or resolve a request."""
+    adapter = ctx._status_adapter
+    retire = getattr(type(adapter), "retire_exec_approval", None)
+    if not card_message_id or not callable(retire):
+        return
+    notice = "Denied via Duo" if choice == "deny" else "Approved via Duo"
+    try:
+        await adapter.retire_exec_approval(ctx._status_chat_id, card_message_id, command, notice,
+                                          metadata=ctx._status_thread_metadata)
+    except Exception:
+        logger.warning("External approval card update failed", exc_info=True)
 
 
 async def _post_timeout_notice(ctx, command: str, card_message_id: Optional[str], timeout_s: int) -> None:

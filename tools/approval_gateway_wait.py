@@ -168,6 +168,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     def _enqueue() -> None:
         register_prepared_approval(session_key, entry)
         _approval._gateway_queues.setdefault(session_key, []).append(entry)
+        _approval._gateway_settle_entries[(session_key, entry.data["request_id"])] = entry
 
     # The leader lookup and our enqueue are ONE critical section: split, two identical requests both
     # miss each other, both enqueue and the user gets duplicate prompts. A ``once`` releases the
@@ -201,6 +202,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             if not queue:
                 _approval._gateway_queues.pop(session_key, None)
             settle, entry.settle = entry.settle, None
+            _approval._gateway_settle_entries.pop((session_key, entry.data["request_id"]), None)
             if choice is None and state in ("timeout", "notify_failed"):
                 # Coalesced followers block on this event: wake them with the leader's outcome rather than
                 # leaving them waiting their own full timeout on a prompt that no longer exists.

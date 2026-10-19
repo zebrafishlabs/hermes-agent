@@ -17,7 +17,7 @@ import importlib
 import logging
 import os
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 from utils import env_var_enabled, is_truthy_value
 from agent.i18n import t
@@ -121,6 +121,9 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # instead of only hearing "denied". Ported from qwibitai/nanoclaw#2832.
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+# Keep the lifecycle handle until the waiter finishes: another surface can
+# answer before a slow messaging API returns the card ID (ESC-415).
+_gateway_settle_entries: dict[tuple[str, str], Any] = {}
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -137,12 +140,16 @@ def unregister_gateway_notify(session_key: str) -> None:
         _gateway_notify_cbs.pop(session_key, None)
         for entry in _gateway_queues.pop(session_key, []):
             entry.event.set()
+        for key in list(_gateway_settle_entries):
+            if key[0] == session_key:
+                _gateway_settle_entries.pop(key, None)
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
                              reason: Optional[str] = None,
-                             request_id: Optional[str] = None) -> int:
+                             request_id: Optional[str] = None,
+                             source: Optional[str] = None) -> int:
     """Unblock waiting agent thread(s) from the gateway's /approve or /deny handler.
 
     *resolve_all* resolves every pending approval (``/approve all``); otherwise the oldest
@@ -170,6 +177,7 @@ def resolve_gateway_approval(session_key: str, choice: str,
         # choice acked to the client here can never be popped-and-lost as a timeout (#112548).
         for entry in targets:
             entry.result = choice
+            entry.data["resolution_source"] = source if source in ("duo", "slack") else None
             if reason:
                 entry.reason = reason
             entry.event.set()
@@ -199,14 +207,21 @@ def list_gateway_approvals(session_key: str) -> list[dict]:
         return [dict(entry.data) for entry in _gateway_queues.get(session_key, [])]
 
 
-def register_gateway_settle(session_key: str, request_id: str, settle) -> bool:
-    """Attach ``settle(reason)`` to one pending approval; it runs once when that wait ends by any path.
-    False when the request is no longer pending (the surface should withdraw its prompt itself)."""
+def register_gateway_settle(session_key: str, request_id: str, settle, *, with_outcome: bool = False) -> bool:
+    """Attach a callback until the waiter finishes, including late card delivery.
+
+    Legacy callbacks receive only reason. Opt-in callbacks also receive the
+    winning choice and source; these are display metadata, not authorization.
+    """
     with _lock:
-        for entry in _gateway_queues.get(session_key, []):
-            if entry.data.get("request_id") == request_id:
-                entry.settle = settle
-                return True
+        entry = _gateway_settle_entries.get((session_key, request_id))
+        if entry is None:
+            entry = next((e for e in _gateway_queues.get(session_key, [])
+                          if e.data.get("request_id") == request_id), None)
+        if entry is not None:
+            entry.settle = (lambda reason: settle(reason, choice=entry.result,
+                           source=entry.data.get("resolution_source"))) if with_outcome else settle
+            return True
     return False
 
 
