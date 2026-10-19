@@ -160,6 +160,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     }
     keys = list(approval_data.get("pattern_keys") or [])
     entry = _ApprovalEntry(approval_data)
+    # TEMP(ESC-415): expose the same identity/deadline to observer transports;
+    # remove this carried hook addition when upstream provides these fields.
+    payload["request_id"] = entry.data["request_id"]
+    payload["timeout_seconds"] = max(_ctx._get_approval_timeout(), 0)
 
     def _enqueue() -> None:
         register_prepared_approval(session_key, entry)
