@@ -387,8 +387,12 @@ _SLACK_RESERVED_COMMANDS = frozenset({
 _SLACK_VIA_HERMES_ONLY = frozenset({
     "topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat",
     "refine", "review", "pause", "whoami", "platform", "insights", "login",
-    # Reserve native capacity for fork plugins; low-frequency /codex-runtime
-    # remains reachable via /hermes without displacing /usage.
+    # Recovery-only, after a restart lost a turn: `/hermes discard` reaches it.
+    "discard",
+    # One-time answer to the low-disk prompt; `/hermes autoprune on` reaches it.
+    "autoprune",
+    # [fork-carried] Reserve native capacity for fork plugins (/close); low-frequency
+    # /codex-runtime remains reachable via /hermes without displacing /usage.
     "codex-runtime"})
 
 
