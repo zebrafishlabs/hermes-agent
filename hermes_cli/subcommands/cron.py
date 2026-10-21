@@ -48,6 +48,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Skip the LLM entirely — run --script on schedule and deliver "
             "its stdout directly. Empty stdout = silent. Classic watchdog "
             "pattern (memory alerts, disk alerts, CI pings).")
+    _flag(cron_create, "--require-script-success", dest="require_script_success", default=None,
+        help="Fail before starting the model if the pre-run script fails (requires --script).")
     cron_create.add_argument("--monitor-script", dest="monitor_script",
         help="Monitor mode: path to a cheap source script under "
             "~/.hermes/scripts/ that runs each tick BEFORE the agent. "
@@ -125,6 +127,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "previous output (dedupe, continue where it left off).")
     cron_edit.add_argument("--no-continuity", dest="continuity", action="store_const", const=False,
         help=("Turn off run-to-run continuity (other context_from job refs are preserved)."))
+    _required = cron_edit.add_mutually_exclusive_group()
+    _required.add_argument("--require-script-success", dest="require_script_success", action="store_true", default=None,
+        help="Fail before starting the model if the pre-run script fails.")
+    _required.add_argument("--no-require-script-success", dest="require_script_success", action="store_false",
+        help="Restore advisory pre-run script failures.")
     cron_edit.add_argument("--monitor-script", dest="monitor_script",
         help="Set/replace the monitor source script (see `hermes cron create "
             "--monitor-script`). Pass empty string to clear.")

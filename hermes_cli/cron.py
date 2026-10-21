@@ -762,7 +762,7 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("model", "model"), ("provider", "model_provider"), ("pinned", "pinned"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
-                   ("interpreter", "interpreter"))
+                   ("interpreter", "interpreter"), ("require_script_success", "require_script_success"))
 
 
 def _job_api_kwargs(args) -> dict[str, Any]:
@@ -772,6 +772,7 @@ def _job_api_kwargs(args) -> dict[str, Any]:
 
 _JOB_DETAIL_LINES = (
     ("script", "  Script: {}"),
+    ("require_script_success", "  Required pre-run script: {}"),
     ("monitor_script", "  Monitor: {} (agent runs only on output change)"),
     ("monitor_url", "  Monitor: {} (agent runs only on output change)"),
     ("no_agent", "  Mode: no-agent (script stdout delivered directly)"),

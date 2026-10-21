@@ -509,6 +509,8 @@ def _format_job(job: dict[str, Any]) -> dict[str, Any]:
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
     }
+    if "require_script_success" in job:
+        result["require_script_success"] = job["require_script_success"]
     for key in _FORMAT_JOB_OPTIONAL_KEYS:
         if job.get(key):
             result[key] = True if key == "no_agent" else job[key]

@@ -692,6 +692,7 @@ def _action_create(a: dict[str, Any]) -> str:
             enabled_toolsets=a["enabled_toolsets"] if a["enabled_toolsets"] is not None else None,
             workdir=_normalize_optional_job_value(a["workdir"]),
             no_agent=_no_agent, attach_to_session=a["attach_to_session"],
+            **({"require_script_success": a["require_script_success"]} if a["require_script_success"] is not None else {}),
             monitor_script=_normalize_optional_job_value(a["monitor_script"]),
             monitor_url=_normalize_optional_job_value(a["monitor_url"]),
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
@@ -911,6 +912,8 @@ def _update_run_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[str
     if a["workdir"] is not None:
         # Empty string clears; otherwise update_job() validates/normalizes.
         updates["workdir"] = _normalize_optional_job_value(a["workdir"]) or None
+    if a.get("require_script_success") is not None:
+        updates["require_script_success"] = a["require_script_success"]
     if a["no_agent"] is not None:
         # Flipping to True needs a script on the job or in this same update.
         target_no_agent = bool(a["no_agent"])
@@ -1014,7 +1017,8 @@ def cronjob(
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: Optional[bool] = None,
-    interpreter: Optional[str] = None) -> str:
+    interpreter: Optional[str] = None,
+    require_script_success: Optional[bool] = None) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility
@@ -1115,6 +1119,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "string",
                 "description": "Optional change-detector that gates the agent: an http(s) URL (fetched each tick) or a script path (same rules as `script`, run each tick) — cheap, no LLM. Output identical to the previous tick skips the agent run entirely; changed output wakes the agent with a diff injected into the prompt. First tick always runs (baseline). Output must be deterministic (no timestamps) or every tick looks changed. Incompatible with no_agent. On update, '' clears."
             },
+            "require_script_success": {
+                "type": "boolean",
+                "description": "Opt in to a fail-closed pre-run script: any nonzero exit, timeout, missing script or import failure stops before the model and records a failed run. True requires script. Omit/false preserves advisory script errors."
+            },
             "no_agent": {
                 "type": "boolean",
                 "default": False,
@@ -1170,7 +1178,7 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned")
+    "paused_reason", "pinned", "require_script_success")
 
 
 def _cronjob_handler(args, **kw):

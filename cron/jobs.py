@@ -1785,6 +1785,13 @@ def _next_run_or_reject_past_oneshot(
     return next_run_at
 
 
+def _validate_required_script(value, script):
+    if value is not None and type(value) is not bool:
+        raise ValueError("require_script_success must be a boolean.")
+    if value is True and not _normalize_job_optional_text(script):
+        raise ValueError("require_script_success=True requires a script.")
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1811,6 +1818,7 @@ def create_job(
     paused_reason: Optional[str] = None,
     pinned: bool = False,
     interpreter: Optional[str] = None,
+    require_script_success: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1820,6 +1828,7 @@ def create_job(
     injected. workdir: absolute cwd for tools/scripts. monitor_script/monitor_url: cheap monitor
     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated.
+    require_script_success: opt in to failing before the model on any pre-run script error.
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
     (a venv can be rebuilt or moved after creation)."""
     if not isinstance(paused, bool):
@@ -1847,6 +1856,7 @@ def create_job(
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
 
     _validate_job_mode_invariants(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"])
+    _validate_required_script(require_script_success, f["script"])
     prompt_text = _coerce_job_text(prompt).strip()
     if not prompt_text and not f["script"] and not normalized_skills:
         raise ValueError(EMPTY_PAYLOAD_ERROR)
@@ -1909,6 +1919,7 @@ def create_job(
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
+        ("require_script_success", require_script_success),
     ):
         if value is not None:
             job[key] = value
@@ -2096,6 +2107,10 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
         _reject_terminal_activation(job, updated, job_id)
+        if "require_script_success" in updates and type(updates["require_script_success"]) is not bool:
+            raise ValueError("require_script_success must be a boolean.")
+        if {"script", "require_script_success"}.intersection(updates):
+            _validate_required_script(updated.get("require_script_success"), updated.get("script"))
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
             _validate_job_mode_invariants(

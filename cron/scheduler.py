@@ -2266,6 +2266,11 @@ def _prepare_job_prompt(
             logger.error("Job '%s': refusing to run — %s", job_id, exc)
             return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None
 
+    required_script = job.get("require_script_success", False)
+    if type(required_script) is not bool or (required_script and not job.get("script")):
+        error = "Invalid required-script configuration: require_script_success must be a boolean and True requires a script."
+        return (False, f"# Cron Job: {job_name}\n\n{error}\n", error, error), None
+
     # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
     if job.get("no_agent"):
         return _run_no_agent_job(job, job_id, job_name, cancel_event), None
@@ -2297,6 +2302,10 @@ def _prepare_job_prompt(
             cancel_event=cancel_event,
         )
         _ran_ok, _script_output = prerun_script
+        if required_script and not _ran_ok:
+            error = f"Required pre-run script failed: {_script_output}"
+            logger.error("Job '%s': required script failed; agent will not run", job_id)
+            return (False, f"# Cron Job: {job_name}\n\n{error}\n", error[:1800], error), None
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
             note_cron_skipped(job)
