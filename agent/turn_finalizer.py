@@ -501,15 +501,15 @@ def apply_llm_output_transform(
     if isinstance(recorded, tuple) and len(recorded) == 3 and recorded[0] == turn_id:
         _, transformed, pre_transform = recorded
         return final_response, transformed, pre_transform
-    if not final_response:
-        return final_response, False, None
+    # Empty model output must not bypass a host-controlled output policy.
+    # A declining hook still preserves the original empty/None value.
     if platform is None:
         platform = getattr(agent, "platform", None) or ""
     transformed, pre_transform = False, None
     # First hook to return a string wins; None/empty leaves the text unchanged.
     for _hook_result in _invoke_hook_safely(
         "transform_llm_output", logger,
-        response_text=final_response,
+        response_text=final_response or "",
         session_id=agent.session_id or "",
         model=agent.model,
         platform=platform,
@@ -518,7 +518,8 @@ def apply_llm_output_transform(
         if isinstance(_hook_result, str) and _hook_result:
             pre_transform, final_response, transformed = final_response, _hook_result, True
             break
-    agent._llm_output_transform = (turn_id, transformed, pre_transform)
+    if final_response or transformed:
+        agent._llm_output_transform = (turn_id, transformed, pre_transform)
     return final_response, transformed, pre_transform
 
 
