@@ -7,6 +7,7 @@ OpenAI-compatible frontend connects at http://localhost:8642/v1 with API_SERVER_
 """
 
 import asyncio
+import base64
 import concurrent.futures
 import errno
 import hashlib
@@ -98,6 +99,7 @@ _CAPABILITY_ENDPOINTS = (
     ("session_chat_stream", ("POST", "/api/sessions/{session_id}/chat/stream")),
     ("session_model_lock", ("POST", "/api/sessions/{session_id}/model")),
     ("browser_control_register", ("POST", "/v1/browser-control/register")),
+    ("livekit_token", ("POST", "/v1/livekit/token", "livekit_token")),
     ("browser_control_ws", ("GET", "/v1/browser-control/ws")),
     ("artifact_upload", ("POST", "/v1/artifacts/upload")),
     ("artifact_download", ("GET", "/v1/artifacts/download/{artifact_id}")))
@@ -820,6 +822,67 @@ def _error_response(
 def _invalid_request(message: str) -> web.Response:
     """400 with the bare ``{message, type}`` envelope the OpenAI-compatible validators use."""
     return web.json_response({"error": {"message": message, "type": "invalid_request_error"}}, status=400)
+
+
+# -- LiveKit avatar token mint (ESC-1159) -------------------------------------------
+# The escher-chrome-plugin avatar pane joins a fresh LiveKit room per pane session;
+# the escher-avatar worker (Synthesia Interactive Avatar) is dispatched at room
+# creation via the token's roomConfig. Credentials live only server-side, read from
+# ~/.hermes/secrets at request time; the minted JWT is returned to the caller but
+# never logged here.
+_LIVEKIT_AVATAR_AGENT_NAME = "escher-avatar"
+_LIVEKIT_TOKEN_DEFAULT_TTL = 7200
+_LIVEKIT_TOKEN_MAX_TTL = 14400
+_LIVEKIT_IDENTITY_MAX_LEN = 128
+
+
+def _livekit_credentials() -> Optional[tuple[str, str, str]]:
+    """(url, api_key, api_secret) from ~/.hermes/secrets, or None when unconfigured.
+
+    Read at request time so secret rotation needs no restart. Values are never logged.
+    """
+    # HERMES_HOME-aware (tests run against an isolated home; Path.home() would trip
+    # the home-I/O guard and could read another profile's secrets under multiplexing).
+    home = Path(os.environ["HERMES_HOME"]) if os.environ.get("HERMES_HOME") else Path.home() / ".hermes"
+    secrets_dir = home / "secrets"
+    try:
+        url = (secrets_dir / "livekit-url").read_text().strip()
+        api_key = (secrets_dir / "livekit-api-key").read_text().strip()
+        api_secret = (secrets_dir / "livekit-api-secret").read_text().strip()
+    except OSError:
+        return None
+    if not (url and api_key and api_secret):
+        return None
+    return url, api_key, api_secret
+
+
+def _b64url(data: bytes) -> bytes:
+    return base64.urlsafe_b64encode(data).rstrip(b"=")
+
+
+def _mint_livekit_join_token(
+    api_key: str, api_secret: str, *, room: str, identity: str, ttl_seconds: int,
+) -> str:
+    """Stdlib HS256 LiveKit access token: join grants + escher-avatar room dispatch.
+
+    Claim shape verified against SDK-minted tokens (~/dev/escher-voice/mint_avatar_link.py
+    readback): video grants plus camelCase roomConfig.agents[].agentName / syncStreams.
+    Token-borne dispatch applies at room CREATION only, hence a unique room per mint.
+    """
+    now = int(time.time())
+    header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    payload = _b64url(json.dumps({
+        "iss": api_key, "sub": identity, "name": identity,
+        "iat": now, "nbf": now, "exp": now + ttl_seconds,
+        "video": {
+            "room": room, "roomJoin": True,
+            "canPublish": True, "canSubscribe": True, "canPublishData": True},
+        "roomConfig": {
+            "agents": [{"agentName": _LIVEKIT_AVATAR_AGENT_NAME}],
+            "syncStreams": True},
+    }).encode())
+    sig = _b64url(hmac.new(api_secret.encode(), header + b"." + payload, hashlib.sha256).digest())
+    return (header + b"." + payload + b"." + sig).decode()
 
 
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
@@ -1672,6 +1735,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
+            # LiveKit avatar pane token mint (ESC-1159; escher-chrome-plugin).
+            ("POST", "/v1/livekit/token", self._handle_livekit_token),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
@@ -2461,6 +2526,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             **_STATIC_FEATURE_FLAGS,
             "run_unknown_resolution": getattr(runner, "session_authority", None) is not None,
             "cors": bool(self._cors_origins),
+            # Presence-only signal for the escher-chrome-plugin avatar pane
+            # (ESC-1159): never exposes the credentials themselves.
+            "livekit_token": _livekit_credentials() is not None,
             # Always advertised for feature-detection; enabled follows config.
             "browser_extension_control": {
                 "enabled": self._browser_control_enabled(),
@@ -2496,6 +2564,53 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 for name, entry in _CAPABILITY_ENDPOINTS
                 if len(entry) < 3 or features[entry[2]]},
         })
+
+    # -- LiveKit avatar pane token mint (ESC-1159; escher-chrome-plugin) ---------------
+
+    async def _handle_livekit_token(self, request: web.Request) -> web.Response:
+        """POST /v1/livekit/token — mint a LiveKit join token with escher-avatar dispatch.
+
+        Fresh unique room per call (token-borne dispatch applies at room creation only).
+        LiveKit credentials stay server-side (~/.hermes/secrets, read per request);
+        the minted JWT is the only secret material that leaves, and it is never logged.
+        Optional JSON body: ``identity`` (str, default "Chris"), ``ttl_seconds``
+        (int, default 7200, clamped to [60, 14400]).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        creds = _livekit_credentials()
+        if creds is None:
+            return _error_response(
+                "LiveKit is not configured on this server.", 503,
+                code="livekit_not_configured")
+        payload: dict[str, Any] = {}
+        if request.can_read_body:
+            try:
+                body = await request.json()
+            except Exception:
+                return _error_response("Request body must be valid JSON.", 400)
+            if not isinstance(body, dict):
+                return _error_response("Request body must be a JSON object.", 400)
+            payload = body
+        identity = payload.get("identity", "Chris")
+        if not isinstance(identity, str) or not identity.strip() or len(identity) > _LIVEKIT_IDENTITY_MAX_LEN:
+            return _error_response(
+                "identity must be a non-empty string of at most "
+                f"{_LIVEKIT_IDENTITY_MAX_LEN} characters.", 400)
+        identity = identity.strip()
+        ttl = payload.get("ttl_seconds", _LIVEKIT_TOKEN_DEFAULT_TTL)
+        if isinstance(ttl, bool) or not isinstance(ttl, int):
+            return _error_response("ttl_seconds must be an integer.", 400)
+        ttl = max(60, min(ttl, _LIVEKIT_TOKEN_MAX_TTL))
+        url, api_key, api_secret = creds
+        room = f"escher-avatar-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        token = _mint_livekit_join_token(
+            api_key, api_secret, room=room, identity=identity, ttl_seconds=ttl)
+        logger.info("[%s] livekit token minted: room=%s identity=%s ttl=%ss",
+                    getattr(self, "name", "api_server"), room, identity, ttl)
+        return web.json_response(
+            {"url": url, "token": token, "room": room, "expires_in": ttl})
 
     # -- Browser-extension control (authenticated local/VPS API) ----------------------
 
