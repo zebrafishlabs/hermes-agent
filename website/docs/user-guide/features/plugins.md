@@ -1126,9 +1126,9 @@ else:
     print("MCP error:", result["error"])
 ```
 
-**Signature:** `ctx.call_mcp(server: str, tool: str, arguments: dict | None = None, timeout: float = 30) -> dict`
+**Signature:** `ctx.call_mcp(server: str, tool: str, arguments: dict | None = None, timeout: float = 30, *, max_result_chars: int | None = None) -> dict`
 
-Returns a stable envelope: `{"ok": True, "result": ...}` (plus `structuredContent` when the server provides it) or `{"ok": False, "error": "..."}`. Results over ~64 KB are truncated and flagged with `"truncated": True`.
+Returns a stable envelope: `{"ok": True, "result": ...}` (plus `structuredContent` when the server provides it) or `{"ok": False, "error": "..."}`. The default result bound is 65,536 characters. Trusted plugin code can opt in per call to a larger (or smaller) bound with `max_result_chars`, an integer from 1 through 2,000,000. This never changes other calls, server permissions, or upstream transport limits. Explicit bounds add `response_chars` and `result_limit_chars` to the envelope. Responses exceeding the chosen bound are truncated and flagged with `"truncated": True`; never treat them as complete. Keep any large response host-side, validate its shape, and project only necessary fields before exposing it to the model. Invalid bounds raise `ValueError` before transport; no value disables the bound.
 
 ### Security: default-off, per-server allowlist
 

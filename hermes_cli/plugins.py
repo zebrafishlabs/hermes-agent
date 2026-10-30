@@ -501,12 +501,16 @@ class PluginContext:
 
     def call_mcp(
         self, server: str, tool: str, arguments: Optional[dict[str, Any]] = None,
-        timeout: float = 30,
+        timeout: float = 30, *, max_result_chars: Optional[int] = None,
     ) -> dict[str, Any]:
         """Call ``tool`` on MCP ``server`` synchronously through :mod:`tools.mcp_tool`'s native client
         (same trust gates, breaker, reconnect — never a parallel connection). Servers not in
         ``plugins.entries.<plugin_id>.mcp_allowlist`` raise ``PermissionError`` (default-deny). ``timeout``
-        clamps to 1–600s; results over ~64KB are truncated with a marker.
+        clamps to 1–600s. Results default to a 65,536-character cap. Trusted plugin
+        code may opt in per call with ``max_result_chars`` (integer 1–2,000,000);
+        this does not change other calls, server grants, or upstream transport bounds.
+        Oversized results retain ``truncated=True`` and must not be treated as complete.
+        Explicit allowances also return ``response_chars`` and ``result_limit_chars``.
 
         This is a per-server grant, deliberately not ambient authority over every configured server.
         TODO(#64228): swap the per-server allowlist for the declared capability model once it lands
@@ -519,6 +523,7 @@ class PluginContext:
                 f"plugins.entries.{self.plugin_id}.mcp_allowlist in config.yaml "
                 f"to grant access (default is no MCP access)."
             )
+        self._mcp_result_limit(max_result_chars)  # Reject invalid bounds before transport.
         try:
             timeout = float(timeout)
         except (TypeError, ValueError):
@@ -528,18 +533,29 @@ class PluginContext:
         raw = _make_tool_handler(server, tool, timeout)(dict(arguments or {}))
         logger.debug("Plugin %s called MCP %s/%s (timeout=%ss, %d chars returned)",
                      self.manifest.name, server, tool, timeout, len(raw or ""))
-        return self._mcp_envelope(raw)
+        return self._mcp_envelope(raw, max_result_chars=max_result_chars)
 
     _MCP_RESULT_CHAR_CAP = 65536
+    _MCP_MAX_RESULT_CHAR_CAP = 2_000_000
 
     @classmethod
-    def _mcp_envelope(cls, raw: Any) -> dict[str, Any]:
+    def _mcp_result_limit(cls, value: Optional[int]) -> int:
+        if value is None:
+            return cls._MCP_RESULT_CHAR_CAP
+        if type(value) is not int or not 1 <= value <= cls._MCP_MAX_RESULT_CHAR_CAP:
+            raise ValueError("max_result_chars must be an integer from 1 through 2000000")
+        return value
+
+    @classmethod
+    def _mcp_envelope(cls, raw: Any, *, max_result_chars: Optional[int] = None) -> dict[str, Any]:
         """Normalize an MCP handler result string into a stable envelope."""
         if not isinstance(raw, str):
             raw = "" if raw is None else str(raw)
-        truncated = len(raw) > cls._MCP_RESULT_CHAR_CAP
+        limit = cls._mcp_result_limit(max_result_chars)
+        response_chars = len(raw)
+        truncated = response_chars > limit
         if truncated:
-            raw = raw[: cls._MCP_RESULT_CHAR_CAP] + "… [truncated]"
+            raw = raw[:limit] + "… [truncated]"
         try:
             parsed: Any = json.loads(raw)
         except (ValueError, TypeError):
@@ -552,6 +568,8 @@ class PluginContext:
                 envelope["structuredContent"] = parsed["structuredContent"]
         else:
             envelope = {"ok": True, "result": parsed if parsed is not None else raw}
+        if max_result_chars is not None:
+            envelope.update(response_chars=response_chars, result_limit_chars=limit)
         return {**envelope, "truncated": True} if truncated else envelope
 
     @staticmethod
