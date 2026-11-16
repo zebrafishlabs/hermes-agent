@@ -39,13 +39,13 @@ def _build_full_manifest(
                 "name": "Track thread",
                 "type": "message",
                 "callback_id": "track_hermes_thread",
-                "description": "Track this thread as a Linear THR ticket (name + optional next step).",
+                "description": "Bookmark this thread in the Tracked threads Slack List.",
             },
             {
                 "name": "Untrack thread",
                 "type": "message",
                 "callback_id": "untrack_hermes_thread",
-                "description": "Stop tracking this thread (its THR ticket moves to Closed).",
+                "description": "Remove this thread from the Tracked threads Slack List.",
             },
         ],
     }
